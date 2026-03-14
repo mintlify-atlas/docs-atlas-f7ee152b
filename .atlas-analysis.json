@@ -1,0 +1,155 @@
+{
+  "projectType": "framework",
+  "projectName": "Faramesh",
+  "projectDescription": "Unified governance plane for AI agents with pre-execution authorization, policy-as-code, and tamper-evident audit trail.",
+  "theme": "aspen",
+  "primaryColor": "#8434f4",
+  "lightColor": "#7c7c7c",
+  "darkColor": "#060606",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/policy-engine",
+              "concepts/dpr-chain",
+              "concepts/defer-workflow",
+              "concepts/adapters",
+              "concepts/multi-agent"
+            ]
+          },
+          {
+            "group": "Integration Guides",
+            "pages": [
+              "guides/python-sdk",
+              "guides/langchain",
+              "guides/mcp-gateway",
+              "guides/kubernetes",
+              "guides/serverless",
+              "guides/cloud-platform"
+            ]
+          },
+          {
+            "group": "Policy Development",
+            "pages": [
+              "policies/writing-policies",
+              "policies/policy-schema",
+              "policies/expressions",
+              "policies/scanners",
+              "policies/testing",
+              "policies/best-practices"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/daemon",
+              "deployment/sidecar",
+              "deployment/production",
+              "deployment/monitoring",
+              "deployment/troubleshooting"
+            ]
+          },
+          {
+            "group": "Security & Compliance",
+            "pages": [
+              "security/threat-model",
+              "security/wal-invariant",
+              "security/audit-trail",
+              "security/compliance-exports"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "CLI Commands",
+            "pages": [
+              "cli/overview",
+              "cli/demo",
+              "cli/init",
+              "cli/serve",
+              "cli/policy",
+              "cli/audit",
+              "cli/agent",
+              "cli/auth"
+            ]
+          },
+          {
+            "group": "Policy Reference",
+            "pages": [
+              "reference/policy-yaml",
+              "reference/rule-effects",
+              "reference/tool-metadata",
+              "reference/session-state",
+              "reference/selectors"
+            ]
+          },
+          {
+            "group": "SDK Reference",
+            "pages": [
+              "sdk/python",
+              "sdk/govern-decorator",
+              "sdk/exceptions",
+              "sdk/configuration"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/pipeline",
+              "architecture/core-modules",
+              "architecture/adapters",
+              "architecture/storage"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Pre-execution policy enforcement with PERMIT/DENY/DEFER",
+    "Policy-as-code using YAML and expr-lang expressions",
+    "Tamper-evident DPR (Decision-Provenance Record) chain",
+    "Human-in-the-loop DEFER workflow for sensitive actions",
+    "Multi-agent governance and cross-agent coordination",
+    "Six deployment adapters (SDK, daemon, sidecar, serverless, MCP, eBPF)",
+    "Session state tracking and history-based rules",
+    "Pre/post-condition scanners for shell, secrets, and PII",
+    "WAL-first ordering invariant for audit integrity",
+    "Cloud platform integration for advanced features"
+  ],
+  "publicApiSurface": [
+    "faramesh demo - Interactive demo of governance in action",
+    "faramesh serve - Start the governance daemon",
+    "faramesh init - Auto-detect environment and generate config",
+    "faramesh policy validate - Validate policy files",
+    "faramesh policy inspect - Inspect compiled policy",
+    "faramesh audit tail - Stream live governance decisions",
+    "faramesh audit verify - Verify DPR chain integrity",
+    "faramesh agent approve - Approve pending DEFER",
+    "faramesh agent deny - Deny pending DEFER",
+    "faramesh agent kill - Activate agent kill switch",
+    "govern() - Python decorator for governed functions",
+    "Policy YAML schema - faramesh-version, rules, vars, tools",
+    "CanonicalActionRequest - Core governance request type",
+    "Decision - PERMIT/DENY/DEFER/SHADOW response",
+    "DPR Chain - Tamper-evident audit record chain",
+    "Session State API - Track agent behavior across calls",
+    "MCP Gateway - Faramesh as MCP server"
+  ]
+}
