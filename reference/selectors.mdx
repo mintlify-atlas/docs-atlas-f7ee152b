@@ -1,0 +1,626 @@
+---
+title: External Selectors Reference
+description: Extend policy conditions with custom operators and external data sources
+---
+
+## Overview
+
+Faramesh policies can integrate **external selectors** — custom functions that fetch data from APIs, databases, or other sources during policy evaluation. Selectors enable:
+
+- **Risk scoring** from fraud detection APIs
+- **Feature flags** from configuration services
+- **User context** from identity providers
+- **Dynamic allowlists** from databases
+- **Real-time threat intelligence**
+
+Selectors are registered in Go code and exposed to policies via namespaced functions (e.g., `data.risk_score()`, `ext.feature_flag()`).
+
+---
+
+## Selector Architecture
+
+### Lazy Evaluation
+
+Selectors are **lazily evaluated** — they only execute when referenced in a matching rule's `when:` condition.
+
+```yaml
+rules:
+  - id: defer-high-risk-accounts
+    match:
+      tool: "stripe/refund"
+      when: "data.risk_score(args.account_id) > 0.8"
+    effect: defer
+```
+
+If this rule doesn't match (e.g., tool is `http/get`), `data.risk_score()` is **never called**.
+
+### Caching
+
+Selector results are **cached per evaluation** to avoid redundant API calls within a single policy decision.
+
+```yaml
+rules:
+  - id: check-risk-refund
+    match:
+      tool: "stripe/refund"
+      when: "data.risk_score(args.account_id) > 0.8"
+    effect: defer
+  
+  - id: check-risk-charge
+    match:
+      tool: "stripe/charge"
+      when: "data.risk_score(args.account_id) > 0.5"
+    effect: defer
+```
+
+If both rules are evaluated in the same request, `data.risk_score(args.account_id)` is fetched **once** and cached.
+
+### Timeout Enforcement
+
+Every selector has a **timeout** (default: 50ms). If the external call exceeds the timeout, the selector returns `nil` and the condition fails gracefully.
+
+---
+
+## Registering Selectors
+
+Selectors are registered in Go code using the `SelectorRegistry`:
+
+```go
+import (
+    "context"
+    "time"
+    "github.com/faramesh/faramesh-core/internal/core/policy"
+)
+
+func RegisterSelectors(reg *policy.SelectorRegistry) {
+    // Risk scoring from fraud detection API
+    reg.Register(policy.SelectorMeta{
+        Name:        "risk_score",
+        Description: "Fetch fraud risk score for account ID",
+        Timeout:     100 * time.Millisecond,
+        CacheTTL:    30 * time.Second,
+        Namespace:   "data",
+    }, func(ctx context.Context, args ...any) (any, error) {
+        accountID := args[0].(string)
+        score, err := fraudAPI.GetRiskScore(ctx, accountID)
+        if err != nil {
+            return nil, err
+        }
+        return score, nil
+    })
+    
+    // Feature flag from config service
+    reg.Register(policy.SelectorMeta{
+        Name:        "feature_flag",
+        Description: "Check if feature flag is enabled",
+        Timeout:     50 * time.Millisecond,
+        CacheTTL:    60 * time.Second,
+        Namespace:   "data",
+    }, func(ctx context.Context, args ...any) (any, error) {
+        flagName := args[0].(string)
+        enabled := configService.IsEnabled(flagName)
+        return enabled, nil
+    })
+    
+    // Account tier from database
+    reg.Register(policy.SelectorMeta{
+        Name:        "account_state",
+        Description: "Fetch account state from database",
+        Timeout:     150 * time.Millisecond,
+        CacheTTL:    120 * time.Second,
+        Namespace:   "data",
+    }, func(ctx context.Context, args ...any) (any, error) {
+        accountID := args[0].(string)
+        account, err := db.GetAccount(ctx, accountID)
+        if err != nil {
+            return nil, err
+        }
+        return map[string]any{
+            "tier":   account.Tier,
+            "status": account.Status,
+            "region": account.Region,
+        }, nil
+    })
+}
+```
+
+---
+
+## Selector Metadata
+
+<ParamField path="Name" type="string" required>
+  Function name exposed to policies.
+  
+  ```go
+  Name: "risk_score"
+  ```
+  
+  Called in policies as: `data.risk_score(...)`
+</ParamField>
+
+<ParamField path="Description" type="string">
+  Human-readable description for documentation.
+  
+  ```go
+  Description: "Fetch fraud risk score (0.0-1.0) for account ID"
+  ```
+</ParamField>
+
+<ParamField path="Timeout" type="time.Duration" default="50ms">
+  Maximum execution time before timeout.
+  
+  ```go
+  Timeout: 100 * time.Millisecond
+  ```
+  
+  If exceeded, selector returns `nil` and condition fails.
+</ParamField>
+
+<ParamField path="CacheTTL" type="time.Duration" default="30s">
+  How long to cache results.
+  
+  ```go
+  CacheTTL: 60 * time.Second
+  ```
+  
+  Cached results are shared across evaluations for the TTL duration.
+</ParamField>
+
+<ParamField path="Namespace" type="string" default="data">
+  Namespace prefix for the function.
+  
+  ```go
+  Namespace: "data"
+  ```
+  
+  Exposed as: `data.risk_score(...)`
+  
+  Common namespaces:
+  - `data` — Primary data sources
+  - `ext` — External services
+  - `custom` — Organization-specific functions
+</ParamField>
+
+---
+
+## Using Selectors in Policies
+
+### Risk Scoring
+
+```yaml
+rules:
+  - id: defer-high-risk-refunds
+    match:
+      tool: "stripe/refund"
+      when: "data.risk_score(args.account_id) > 0.8"
+    effect: defer
+    reason: "High fraud risk account (score > 0.8)"
+    reason_code: HIGH_RISK_ACCOUNT
+```
+
+### Feature Flags
+
+```yaml
+rules:
+  - id: permit-new-billing-beta
+    match:
+      tool: "billing/*"
+      when: "data.feature_flag('new_billing_enabled') == true"
+    effect: permit
+    reason: "New billing system enabled"
+  
+  - id: deny-old-billing
+    match:
+      tool: "billing/*"
+      when: "data.feature_flag('new_billing_enabled') == false"
+    effect: deny
+    reason: "Old billing system disabled"
+```
+
+### Account Context
+
+```yaml
+rules:
+  - id: defer-refunds-for-trial-accounts
+    match:
+      tool: "stripe/refund"
+      when: "data.account_state(principal.id).tier == 'trial'"
+    effect: defer
+    reason: "Refunds for trial accounts require approval"
+  
+  - id: permit-enterprise-refunds
+    match:
+      tool: "stripe/refund"
+      when: "data.account_state(principal.id).tier == 'enterprise' && args.amount <= 1000"
+    effect: permit
+    reason: "Enterprise accounts: auto-approve refunds ≤ $1000"
+```
+
+### Dynamic Allowlists
+
+```yaml
+rules:
+  - id: deny-blocked-domains
+    match:
+      tool: "http/*"
+      when: "data.is_blocked_domain(args.url)"
+    effect: deny
+    reason: "Domain is on blocklist"
+    reason_code: BLOCKED_DOMAIN
+  
+  - id: permit-allowlist-domains
+    match:
+      tool: "http/*"
+      when: "data.is_allowed_domain(args.url)"
+    effect: permit
+    reason: "Domain is on allowlist"
+```
+
+---
+
+## Selector Execution Flow
+
+1. **Rule matches** → Policy evaluates `when:` condition
+2. **Selector called** → Check cache for result
+3. **Cache miss** → Execute selector function with timeout
+4. **Result returned** → Cache for TTL duration
+5. **Condition evaluated** → `true`/`false` determines rule match
+
+### Example Timeline
+
+```yaml
+rules:
+  - id: check-risk
+    match:
+      tool: "stripe/refund"
+      when: "data.risk_score(args.account_id) > 0.8"
+    effect: defer
+```
+
+**Execution:**
+
+```
+t=0ms    Rule matches (tool = "stripe/refund")
+t=1ms    Evaluate when: condition
+t=1ms    Call data.risk_score("acc_123")
+t=2ms    Cache miss → Fetch from API
+t=25ms   API returns score: 0.92
+t=26ms   Cache result (TTL=30s)
+t=27ms   Evaluate: 0.92 > 0.8 → true
+t=28ms   Rule matches → effect: defer
+```
+
+**Subsequent call (within TTL):**
+
+```
+t=0ms    Rule matches
+t=1ms    Call data.risk_score("acc_123")
+t=1ms    Cache hit → return 0.92
+t=2ms    Evaluate: 0.92 > 0.8 → true
+```
+
+---
+
+## Error Handling
+
+### Timeout
+
+If selector exceeds timeout:
+
+```yaml
+when: "data.risk_score(args.account_id) > 0.8"
+```
+
+- Selector returns `nil`
+- Condition evaluates to `false`
+- Rule does **not** match
+- Evaluation continues to next rule
+
+**Mitigation:**
+
+```yaml
+rules:
+  # If risk_score times out, defer by default (fail-safe)
+  - id: defer-on-timeout
+    match:
+      tool: "stripe/refund"
+      when: "data.risk_score(args.account_id) == nil"
+    effect: defer
+    reason: "Risk scoring unavailable — manual review required"
+```
+
+### API Errors
+
+If selector function returns error:
+
+```go
+func(ctx context.Context, args ...any) (any, error) {
+    score, err := fraudAPI.GetRiskScore(ctx, accountID)
+    if err != nil {
+        return nil, err  // Returns nil to policy
+    }
+    return score, nil
+}
+```
+
+- Selector returns `nil`
+- Condition fails
+- Use fallback rules for resilience
+
+---
+
+## Selector Snapshot (DPR)
+
+Every selector call is recorded in the **Decision Provenance Record (DPR)** for audit:
+
+```json
+{
+  "selector": "risk_score",
+  "args": ["acc_123"],
+  "result": 0.92,
+  "duration_ns": 23456789,
+  "cached": false
+}
+```
+
+Fields:
+- `selector` — Function name
+- `args` — Arguments passed
+- `result` — Return value
+- `error` — Error message (if failed)
+- `duration_ns` — Execution time in nanoseconds
+- `cached` — Whether result was served from cache
+
+---
+
+## Custom Operators
+
+In addition to **selectors** (external data sources), Faramesh supports **custom operators** — deterministic functions for complex condition logic.
+
+### Registering Operators
+
+```go
+import "github.com/faramesh/faramesh-core/internal/core/policy"
+
+func RegisterOperators(reg *policy.OperatorRegistry) {
+    // Geographic fence check
+    reg.Register(policy.OperatorMeta{
+        Name:          "geo_fence",
+        Description:   "Check if IP is in allowed region",
+        Deterministic: true,
+        Timeout:       10 * time.Millisecond,
+        ArgTypes:      []string{"string", "string"},
+        ReturnType:    "bool",
+    }, func(args ...any) (any, error) {
+        ip := args[0].(string)
+        region := args[1].(string)
+        return geoIP.IsInRegion(ip, region), nil
+    })
+    
+    // Email domain validation
+    reg.Register(policy.OperatorMeta{
+        Name:          "is_company_email",
+        Description:   "Check if email is from company domain",
+        Deterministic: true,
+        Timeout:       5 * time.Millisecond,
+    }, func(args ...any) (any, error) {
+        email := args[0].(string)
+        return strings.HasSuffix(email, "@company.com"), nil
+    })
+}
+```
+
+### Using Operators in Policies
+
+```yaml
+rules:
+  # Geographic restrictions
+  - id: deny-requests-outside-us
+    match:
+      tool: "*"
+      when: "!geo_fence(args.ip_address, 'us-east-1')"
+    effect: deny
+    reason: "Requests only allowed from US East region"
+  
+  # Email validation
+  - id: defer-external-email-recipients
+    match:
+      tool: "send_email"
+      when: "!is_company_email(args.recipient)"
+    effect: defer
+    reason: "External email recipients require approval"
+```
+
+### Operator vs. Selector
+
+| Operator | Selector |
+|----------|----------|
+| **Deterministic** (same input → same output) | **Non-deterministic** (may change over time) |
+| Local computation | External API call |
+| Fast (&lt;10ms) | Slower (10-100ms+) |
+| Cached by input hash | Cached by TTL |
+| Example: `geo_fence()` | Example: `risk_score()` |
+
+---
+
+## Performance Considerations
+
+### Timeout Budget
+
+- Default per-selector timeout: **50ms**
+- Multiple selectors accumulate time
+- Total evaluation timeout: **50ms** (configurable)
+
+**Example:**
+
+```yaml
+when: "data.risk_score(args.account_id) > 0.8 && data.feature_flag('strict_mode')"
+```
+
+- `risk_score()`: 30ms
+- `feature_flag()`: 15ms
+- **Total: 45ms** ✅ Within budget
+
+### Cache Strategy
+
+- **High-frequency data** (feature flags): Long TTL (60s+)
+- **User context**: Medium TTL (30s)
+- **Real-time risk**: Short TTL (5-10s)
+
+### Fail-Safe Defaults
+
+Always provide fallback rules for selector failures:
+
+```yaml
+rules:
+  # Primary: Use risk score
+  - id: defer-high-risk
+    match:
+      tool: "stripe/refund"
+      when: "data.risk_score(args.account_id) > 0.8"
+    effect: defer
+  
+  # Fallback: If risk_score unavailable, defer anyway
+  - id: defer-on-risk-unavailable
+    match:
+      tool: "stripe/refund"
+      when: "data.risk_score(args.account_id) == nil"
+    effect: defer
+    reason: "Risk scoring unavailable — manual review"
+```
+
+---
+
+## Complete Example
+
+**Go Registration:**
+
+```go
+func RegisterCustomSelectors(reg *policy.SelectorRegistry) {
+    // Fraud risk score
+    reg.Register(policy.SelectorMeta{
+        Name:        "risk_score",
+        Description: "Fraud risk score (0.0-1.0)",
+        Timeout:     100 * time.Millisecond,
+        CacheTTL:    30 * time.Second,
+        Namespace:   "data",
+    }, fetchRiskScore)
+    
+    // Account tier
+    reg.Register(policy.SelectorMeta{
+        Name:        "account_tier",
+        Description: "User account tier",
+        Timeout:     50 * time.Millisecond,
+        CacheTTL:    60 * time.Second,
+        Namespace:   "data",
+    }, fetchAccountTier)
+    
+    // Feature flag
+    reg.Register(policy.SelectorMeta{
+        Name:        "feature_enabled",
+        Description: "Check feature flag",
+        Timeout:     50 * time.Millisecond,
+        CacheTTL:    120 * time.Second,
+        Namespace:   "data",
+    }, checkFeatureFlag)
+}
+```
+
+**Policy:**
+
+```yaml
+faramesh-version: "1.0"
+agent-id: "production-agent"
+
+rules:
+  # High-risk accounts: Always defer
+  - id: defer-high-risk
+    match:
+      tool: "stripe/refund"
+      when: "data.risk_score(args.account_id) > 0.8"
+    effect: defer
+    reason: "High fraud risk (score > 0.8)"
+    reason_code: HIGH_RISK_ACCOUNT
+    incident_severity: high
+  
+  # Enterprise: Auto-approve large refunds
+  - id: permit-enterprise-refunds
+    match:
+      tool: "stripe/refund"
+      when: "data.account_tier(principal.id) == 'enterprise' && args.amount <= 5000"
+    effect: permit
+    reason: "Enterprise auto-approval"
+  
+  # Beta feature: New refund flow
+  - id: use-new-refund-flow
+    match:
+      tool: "stripe/refund"
+      when: "data.feature_enabled('new_refund_flow')"
+    effect: permit
+    reason: "New refund flow enabled"
+  
+  # Fallback: Risk scoring unavailable
+  - id: defer-on-risk-timeout
+    match:
+      tool: "stripe/refund"
+      when: "data.risk_score(args.account_id) == nil"
+    effect: defer
+    reason: "Risk scoring unavailable — manual review"
+  
+  # Default: Small refunds
+  - id: permit-small-refunds
+    match:
+      tool: "stripe/refund"
+      when: "args.amount <= 100"
+    effect: permit
+    reason: "Small refunds auto-approved"
+
+default_effect: deny
+```
+
+---
+
+## Best Practices
+
+### Design
+- Keep selectors **fast** (&lt;100ms)
+- Design for **failure** (timeouts, API errors)
+- Use **deterministic** operators when possible
+- Provide **fallback rules** for selector unavailability
+
+### Security
+- Validate selector inputs (prevent injection)
+- Use authentication for external APIs
+- Rate-limit selector calls to prevent DoS
+- Audit selector results in DPR
+
+### Performance
+- Cache aggressively (30-120s TTL)
+- Batch external API calls when possible
+- Monitor selector latency in production
+- Set conservative timeouts
+
+### Testing
+- Mock selectors in unit tests
+- Test timeout behavior
+- Verify cache invalidation
+- Load test with production traffic
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Policy YAML" icon="file-code" href="/reference/policy-yaml">
+    Complete policy schema reference
+  </Card>
+  <Card title="Session State" icon="database" href="/reference/session-state">
+    Session history and counters
+  </Card>
+  <Card title="Rule Effects" icon="gavel" href="/reference/rule-effects">
+    PERMIT, DENY, DEFER, and SHADOW
+  </Card>
+  <Card title="Tool Metadata" icon="wrench" href="/reference/tool-metadata">
+    Reversibility and blast radius
+  </Card>
+</CardGroup>

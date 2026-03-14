@@ -1,0 +1,359 @@
+---
+title: Python SDK
+description: Add governance to Python agents in 60 seconds with the govern() decorator
+---
+
+The Faramesh Python SDK provides zero-infrastructure governance for Python agents. Install once, wrap your functions with `govern()`, and every call passes through the policy engine.
+
+## Installation
+
+<Steps>
+  <Step title="Install the SDK">
+    ```bash
+    pip install faramesh
+    ```
+  </Step>
+
+  <Step title="Create a policy file">
+    ```yaml policy.yaml
+    faramesh-version: '1.0'
+    agent-id: my-agent
+    default_effect: permit
+
+    rules:
+      - id: deny-destructive-shell
+        match:
+          tool: shell/run
+          when: 'args["cmd"] matches "rm\\s+-[rf]"'
+        effect: deny
+        reason: destructive shell command blocked
+        reason_code: DESTRUCTIVE_SHELL_COMMAND
+
+      - id: defer-high-value-refund
+        match:
+          tool: stripe_refund
+          when: 'args["amount"] > 1000'
+        effect: defer
+        reason: refund exceeds threshold — requires approval
+        reason_code: HIGH_VALUE_REFUND
+    ```
+  </Step>
+
+  <Step title="Wrap your functions">
+    ```python
+    from faramesh import govern
+
+    def stripe_refund(amount: float, currency: str) -> dict:
+        """Refund a charge via Stripe."""
+        # Your Stripe API call here
+        return {"status": "success", "amount": amount}
+
+    # Wrap the function with governance
+    governed_refund = govern(
+        stripe_refund,
+        policy='policy.yaml',
+        agent_id='payment-bot'
+    )
+
+    # All calls now go through the policy engine
+    result = governed_refund(amount=100, currency='usd')  # PERMIT
+    ```
+  </Step>
+</Steps>
+
+## How It Works
+
+The `govern()` decorator intercepts function calls and evaluates them against your policy **before** execution:
+
+1. **Auto-start daemon**: On first call, the SDK automatically downloads and starts the Faramesh daemon
+2. **Serialize arguments**: Function arguments are serialized to JSON-safe format
+3. **Evaluate policy**: The daemon evaluates the call against your policy rules
+4. **Return decision**: Based on the effect (PERMIT/DENY/DEFER), the SDK either executes the function or raises an exception
+
+<Note>
+  The daemon is auto-started in development mode. In production, start it manually:
+  ```bash
+  faramesh serve --policy policy.yaml
+  ```
+</Note>
+
+## API Reference
+
+### govern()
+
+Wrap any callable with governance.
+
+```python
+govern(
+    fn: Callable,
+    *,
+    policy: str = "policy.yaml",
+    agent_id: str | None = None,
+    tool_id: str | None = None,
+    socket_path: str = "/tmp/faramesh.sock",
+    auto_start: bool = True,
+) -> Callable
+```
+
+#### Parameters
+
+- `fn`: The function to govern
+- `policy`: Path to the policy YAML file
+- `agent_id`: Agent identity (defaults to `module.function_name`)
+- `tool_id`: Tool identifier used in policy rules (defaults to function name)
+- `socket_path`: Path to the daemon Unix socket
+- `auto_start`: Auto-start daemon on first call (development mode)
+
+#### Returns
+
+A wrapped function with identical signature, type hints, and docstring. The wrapper:
+- Preserves `__name__`, `__doc__`, `__annotations__`, `__module__`
+- Sets `__wrapped__` to the original function
+- Preserves Pydantic `BaseModel` parameters
+- Preserves LangChain `@tool` metadata (`name`, `description`, `args_schema`)
+
+## Exception Handling
+
+The SDK raises exceptions for DENY and DEFER effects:
+
+### DenyError
+
+Raised when the policy denies a tool call.
+
+```python
+from faramesh import govern, DenyError
+
+governed_refund = govern(stripe_refund, policy='policy.yaml')
+
+try:
+    result = governed_refund(amount=10000, currency='usd')
+except DenyError as e:
+    print(f"Tool: {e.tool_id}")
+    print(f"Rule: {e.rule_id}")
+    print(f"Reason: {e.reason}")
+    print(f"Code: {e.reason_code}")
+    # Output:
+    # Tool: stripe_refund
+    # Rule: defer-high-value-refund
+    # Reason: refund exceeds threshold — requires approval
+    # Code: HIGH_VALUE_REFUND
+```
+
+### DeferredError
+
+Raised when a DEFER times out or is explicitly denied.
+
+```python
+from faramesh import govern, DeferredError
+
+governed_refund = govern(stripe_refund, policy='policy.yaml')
+
+try:
+    result = governed_refund(amount=5000, currency='usd')
+    # SDK blocks waiting for approval (default 5 minutes)
+except DeferredError as e:
+    print(f"Tool: {e.tool_id}")
+    print(f"Token: {e.defer_token}")
+    print(f"Reason: {e.reason}")
+    print(f"Expired: {e.expired}")
+    # To approve from CLI:
+    # faramesh agent approve {e.defer_token}
+```
+
+<Tip>
+  DEFER blocks the SDK until approval, denial, or timeout. The default timeout is 300 seconds (5 minutes).
+</Tip>
+
+## Complete Examples
+
+### Basic Function Governance
+
+```python
+from faramesh import govern, DenyError, DeferredError
+
+def send_email(to: str, subject: str, body: str) -> dict:
+    """Send an email via SendGrid."""
+    # Your SendGrid API call
+    return {"status": "sent", "to": to}
+
+governed_email = govern(
+    send_email,
+    policy='email-policy.yaml',
+    agent_id='email-bot',
+    tool_id='send_email'
+)
+
+try:
+    result = governed_email(
+        to="user@example.com",
+        subject="Welcome",
+        body="Hello!"
+    )
+    print(f"Email sent: {result}")
+except DenyError as e:
+    print(f"Email blocked: {e.reason}")
+except DeferredError as e:
+    print(f"Awaiting approval: {e.defer_token}")
+```
+
+### Decorator Usage
+
+You can also use `govern()` as a decorator:
+
+```python
+from faramesh import govern
+
+@govern(policy='policy.yaml', agent_id='payment-bot')
+def stripe_refund(amount: float, currency: str) -> dict:
+    """Refund a charge via Stripe."""
+    return {"status": "success", "amount": amount}
+
+# Function is automatically governed
+result = stripe_refund(amount=100, currency='usd')
+```
+
+<Warning>
+  When using `@govern` as a decorator, you cannot specify the function as the first argument. Use keyword arguments only:
+  ```python
+  @govern(policy='policy.yaml')  # ✓ Correct
+  def my_func(): ...
+
+  @govern(my_func, policy='policy.yaml')  # ✗ Wrong
+  ```
+</Warning>
+
+### Pydantic Model Support
+
+The SDK automatically serializes Pydantic models:
+
+```python
+from pydantic import BaseModel
+from faramesh import govern
+
+class RefundRequest(BaseModel):
+    amount: float
+    currency: str
+    reason: str
+
+@govern(policy='policy.yaml')
+def process_refund(request: RefundRequest) -> dict:
+    """Process a refund request."""
+    return {"status": "processed", "amount": request.amount}
+
+# Pydantic model is serialized via .model_dump() for governance
+request = RefundRequest(amount=100, currency='usd', reason='duplicate charge')
+result = process_refund(request)
+```
+
+### Multiple Governed Functions
+
+```python
+from faramesh import govern
+
+# All functions share the same daemon connection
+governed_refund = govern(stripe_refund, policy='policy.yaml')
+governed_email = govern(send_email, policy='policy.yaml')
+governed_db_query = govern(query_database, policy='policy.yaml')
+
+# Each call is evaluated independently
+result1 = governed_refund(amount=100, currency='usd')
+result2 = governed_email(to="user@example.com", subject="Receipt", body="...")
+result3 = governed_db_query(table="users", filter="active=true")
+```
+
+## FarameshClient (Low-Level API)
+
+For advanced use cases, use the low-level client directly:
+
+```python
+from faramesh.client import FarameshClient
+
+client = FarameshClient(socket_path="/tmp/faramesh.sock")
+
+# Submit a governance request
+decision = client.govern(
+    agent_id="my-agent",
+    session_id="session-123",
+    tool_id="stripe_refund",
+    args={"amount": 100, "currency": "usd"}
+)
+
+print(decision)
+# {
+#   "effect": "PERMIT",
+#   "rule_id": "allow-small-refunds",
+#   "reason": "amount below threshold",
+#   "reason_code": "BELOW_THRESHOLD",
+#   "latency_ms": 12
+# }
+
+# Handle DEFER
+if decision["effect"] == "DEFER":
+    defer_token = decision["defer_token"]
+    status = client.wait_for_defer(
+        agent_id="my-agent",
+        defer_token=defer_token,
+        timeout=300.0  # 5 minutes
+    )
+    if status == "approved":
+        # Execute the function
+        pass
+    elif status == "denied":
+        print("Denied by approver")
+    elif status == "expired":
+        print("Approval timeout")
+```
+
+## Production Deployment
+
+In production, start the daemon manually instead of relying on auto-start:
+
+<Steps>
+  <Step title="Disable auto-start">
+    ```python
+    governed_refund = govern(
+        stripe_refund,
+        policy='policy.yaml',
+        auto_start=False  # Disable auto-start in production
+    )
+    ```
+  </Step>
+
+  <Step title="Start the daemon">
+    ```bash
+    faramesh serve --policy policy.yaml --socket /var/run/faramesh.sock
+    ```
+  </Step>
+
+  <Step title="Point SDK to production socket">
+    ```python
+    governed_refund = govern(
+        stripe_refund,
+        policy='policy.yaml',
+        socket_path='/var/run/faramesh.sock',
+        auto_start=False
+    )
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+  Run the daemon as a systemd service or Docker container for production workloads.
+</Tip>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="LangChain Integration" icon="link" href="/guides/langchain">
+    Use Faramesh with LangChain agents and tools
+  </Card>
+  <Card title="Policy Reference" icon="file-lines" href="/concepts/policy-engine">
+    Learn the policy YAML syntax and expression language
+  </Card>
+  <Card title="Serverless Deployment" icon="cloud" href="/guides/serverless">
+    Deploy governed agents to Lambda or Cloud Run
+  </Card>
+  <Card title="Audit Trail" icon="list" href="/concepts/dpr-chain">
+    Explore the tamper-evident DPR audit chain
+  </Card>
+</CardGroup>

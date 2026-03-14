@@ -1,0 +1,593 @@
+---
+title: Policy Best Practices
+description: Patterns, anti-patterns, and recommendations for effective policy design
+icon: lightbulb
+---
+
+This guide covers proven patterns and common pitfalls when writing Faramesh policies.
+
+## Foundational Principles
+
+### 1. Default Deny
+
+Always start with `default_effect: deny` and explicitly permit safe operations:
+
+```yaml
+# ✅ GOOD: Default deny, explicit permits
+default_effect: deny
+
+rules:
+  - id: permit-read-only
+    match: { tool: "*/read" }
+    effect: permit
+  
+  - id: permit-safe-http
+    match: { tool: "http/get" }
+    effect: permit
+```
+
+```yaml
+# ❌ BAD: Default permit, explicit denies
+default_effect: permit
+
+rules:
+  - id: deny-destructive
+    match: { tool: "shell/run", when: 'args["cmd"] matches "rm"' }
+    effect: deny
+```
+
+<Info>
+Default deny follows the **principle of least privilege**: only explicitly permitted actions are allowed. This reduces risk from unknown/new tools.
+</Info>
+
+### 2. Order Matters
+
+Place specific rules **before** broad catch-all patterns:
+
+```yaml
+# ✅ GOOD: Specific before general
+rules:
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 500'
+    effect: defer
+  
+  - id: permit-normal-stripe
+    match: { tool: "stripe/*" }
+    effect: permit
+```
+
+```yaml
+# ❌ BAD: General rule shadows specific rule
+rules:
+  - id: permit-all-stripe
+    match: { tool: "stripe/*" }
+    effect: permit
+  
+  - id: defer-high-value-refund  # UNREACHABLE!
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 500'
+    effect: defer
+```
+
+Run `faramesh policy validate` to detect shadowed rules.
+
+### 3. Descriptive Rule IDs
+
+Use clear, searchable rule IDs:
+
+```yaml
+# ✅ GOOD: Descriptive IDs
+- id: defer-high-value-refund
+- id: deny-destructive-shell
+- id: permit-read-only-http
+```
+
+```yaml
+# ❌ BAD: Generic IDs
+- id: rule-1
+- id: stripe-rule
+- id: allow
+```
+
+Rule IDs appear in:
+- Audit logs (searched during incident response)
+- Deferral review interfaces
+- Analytics dashboards
+
+### 4. Actionable Reasons
+
+Write `reason` fields for humans, `reason_code` for machines:
+
+```yaml
+# ✅ GOOD: Clear, actionable
+reason: "Refund of $600 exceeds $500 threshold and requires finance approval"
+reason_code: HIGH_VALUE_REFUND
+```
+
+```yaml
+# ❌ BAD: Vague
+reason: "blocked"
+reason_code: BLOCKED
+```
+
+The `reason` field is shown to:
+- Human reviewers during deferral approval
+- Agents when calls are denied
+- Operators investigating incidents
+
+## Rule Patterns
+
+### Financial Threshold with Variable
+
+```yaml
+vars:
+  max_refund: 500
+  max_transfer: 10000
+
+rules:
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds $500 threshold
+  
+  - id: defer-high-value-transfer
+    match:
+      tool: bank/transfer
+      when: 'args["amount"] > vars["max_transfer"]'
+    effect: defer
+    reason: transfer exceeds $10,000 threshold
+```
+
+**Why:**
+- Thresholds change over time
+- Variables are easier to update than hardcoded values
+- Same variable can be reused across rules
+
+### Destructive Command Detection
+
+```yaml
+rules:
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: |
+        args["cmd"] matches "rm\\s+-[rf]" ||
+        args["cmd"] matches "mkfs" ||
+        args["cmd"] matches "dd\\s+if=" ||
+        args["cmd"] matches ">(\s*/dev/|\s*/proc/)" ||
+        args["cmd"] matches ":(){:|:&};:"
+    effect: deny
+    reason: destructive shell command blocked
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+    incident_severity: critical
+```
+
+**Patterns to block:**
+- `rm -rf` / `rm -fr`
+- `mkfs` (filesystem format)
+- `dd if=` (disk overwrite)
+- `> /dev/` (device redirection)
+- Fork bombs: `:(){:|:&};:`
+
+### Data Exfiltration Sequence Detection
+
+```yaml
+rules:
+  - id: defer-delete-after-exfil
+    match:
+      tool: delete_*
+      when: 'history_contains_within("http/post", 120)'
+    effect: defer
+    reason: Delete blocked after external HTTP POST in last 2 minutes
+    reason_code: SEQUENCE_EXFIL_DELETE
+  
+  - id: deny-http-after-secret-access
+    match:
+      tool: http/*
+      when: |
+        history_contains_within("secrets/*", 300) ||
+        history_contains_within("vault/*", 300)
+    effect: deny
+    reason: Outbound HTTP blocked after credential access
+    reason_code: SEQUENCE_SECRET_LEAK
+  
+  - id: defer-shell-after-read-http
+    match:
+      tool: shell/*
+      when: 'history_sequence("read_file", "http/post")'
+    effect: defer
+    reason: Shell execution after read → exfil pattern
+    reason_code: SEQUENCE_TRAJECTORY_DANGEROUS
+```
+
+**Why:**
+- Catches multi-step attacks that bypass single-rule checks
+- Read → HTTP → Delete is a common exfiltration pattern
+- Secret access → HTTP is credential theft
+
+### Tier-Based Limits
+
+```yaml
+rules:
+  - id: defer-free-tier-high-value
+    match:
+      tool: stripe/refund
+      when: 'principal.tier == "free" && args["amount"] > 100'
+    effect: defer
+    reason: Free tier refunds over $100 require approval
+  
+  - id: permit-enterprise-refund
+    match:
+      tool: stripe/refund
+      when: 'principal.tier == "enterprise" && args["amount"] <= 5000'
+    effect: permit
+    reason: Enterprise tier auto-approved up to $5000
+```
+
+### Time-Based Controls
+
+```yaml
+rules:
+  - id: defer-after-hours-high-value
+    match:
+      tool: stripe/refund
+      when: |
+        args["amount"] > 1000 &&
+        (time.hour < 9 || time.hour >= 17)
+    effect: defer
+    reason: High-value refund outside business hours (9am-5pm UTC)
+  
+  - id: defer-weekend-operations
+    match:
+      tool: "*"
+      when: |
+        time.weekday >= 6 &&
+        tool.blast_radius == "external"
+    effect: defer
+    reason: External operations on weekends require approval
+```
+
+### Multi-Agent Delegation Depth
+
+```yaml
+rules:
+  - id: defer-deep-delegation
+    match:
+      tool: "*"
+      when: 'delegation.depth > 2'
+    effect: defer
+    reason: Delegation chain too deep (max 2 levels)
+  
+  - id: deny-unverified-delegation
+    match:
+      tool: "*"
+      when: |
+        delegation.depth > 0 &&
+        !delegation.agent_identity_verified &&
+        tool.blast_radius == "external"
+    effect: deny
+    reason: Unverified delegation chain for external tool
+```
+
+### Rate Limiting
+
+```yaml
+rules:
+  - id: defer-high-call-count
+    match:
+      tool: "*"
+      when: 'session.call_count > 100'
+    effect: defer
+    reason: Session exceeded 100 tool calls
+  
+  - id: defer-stripe-burst
+    match:
+      tool: stripe/*
+      when: 'history_tool_count("stripe/*") >= 10'
+    effect: defer
+    reason: More than 10 Stripe calls in session
+  
+  - id: defer-repeated-denials
+    match:
+      tool: "*"
+      when: 'deny_count_within(60) >= 3'
+    effect: defer
+    reason: 3+ policy denials in last minute (potential attack)
+```
+
+## Scanner Best Practices
+
+### Scan All External Tools
+
+```yaml
+post_rules:
+  - id: redact-http-secrets
+    match: { tool: "http/*" }
+    scan:
+      - category: secrets_all
+        action: redact
+      - category: pii_email
+        action: redact
+```
+
+### Deny Private Keys in Shell Output
+
+```yaml
+post_rules:
+  - id: deny-shell-private-keys
+    match: { tool: "shell/*" }
+    scan:
+      - category: secret_ssh_key
+        action: deny
+        reason: shell output contains private key
+      - category: secret_aws_key
+        action: deny
+```
+
+### Warn on PII Leakage
+
+```yaml
+post_rules:
+  - id: warn-pii-in-logs
+    match: { tool: "logs/*" }
+    scan:
+      - category: pii_ssn
+        action: warn
+      - category: pii_credit_card
+        action: warn
+```
+
+**Why `warn` instead of `redact`:**
+- Logs may legitimately contain PII in certain contexts
+- `warn` lets you monitor without breaking workflows
+- Review warnings and upgrade to `redact` if needed
+
+## Common Anti-Patterns
+
+### ❌ Hardcoded Thresholds
+
+```yaml
+# ❌ BAD
+rules:
+  - when: 'args["amount"] > 500'
+  - when: 'args["amount"] > 500'  # duplicated!
+  - when: 'len(args["recipients"]) > 50'
+  - when: 'len(args["recipients"]) > 50'  # duplicated!
+```
+
+```yaml
+# ✅ GOOD: Use variables
+vars:
+  max_refund: 500
+  max_email_recipients: 50
+
+rules:
+  - when: 'args["amount"] > vars["max_refund"]'
+  - when: 'len(args["recipients"]) > vars["max_email_recipients"]'
+```
+
+### ❌ Overly Broad Permits
+
+```yaml
+# ❌ BAD: Permits everything
+default_effect: permit
+```
+
+```yaml
+# ✅ GOOD: Default deny, explicit permits
+default_effect: deny
+
+rules:
+  - match: { tool: "http/get" }
+    effect: permit
+  - match: { tool: "read_*" }
+    effect: permit
+```
+
+### ❌ Missing Tool Metadata
+
+```yaml
+# ❌ BAD: No metadata declared
+rules:
+  - match: { tool: "stripe/refund" }
+    effect: defer
+```
+
+```yaml
+# ✅ GOOD: Declare metadata, reference in rules
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    tags: [financial]
+
+rules:
+  - match:
+      tool: "*"
+      when: 'tool.blast_radius == "external" && tool.reversibility == "irreversible"'
+    effect: defer
+```
+
+**Why:**
+- Tool metadata enables generic rules
+- Easier to maintain than hardcoding tool lists
+- Self-documenting
+
+### ❌ No Incident Categorization
+
+```yaml
+# ❌ BAD: No categorization
+rules:
+  - id: deny-destructive-shell
+    effect: deny
+    reason: blocked
+```
+
+```yaml
+# ✅ GOOD: Full incident metadata
+rules:
+  - id: deny-destructive-shell
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+    incident_category: destructive_command
+    incident_severity: critical
+```
+
+**Why:**
+- `incident_category` enables grouping in analytics
+- `incident_severity` drives alerting
+- `reason_code` enables automation
+
+### ❌ Testing Only Happy Path
+
+```bash
+# ❌ BAD: Only test success case
+faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":100}'
+```
+
+```bash
+# ✅ GOOD: Test edge cases
+faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":100}'   # normal
+faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":500}'   # boundary
+faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":600}'   # over threshold
+faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":0}'     # zero
+faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":-100}'  # negative
+```
+
+## Policy Organization
+
+### Small Policies (1-10 Rules)
+
+Single file:
+
+```
+policies/
+  production.yaml
+```
+
+### Medium Policies (10-50 Rules)
+
+Group by domain:
+
+```
+policies/
+  payment.yaml
+  security.yaml
+  compliance.yaml
+```
+
+Merge at deploy time:
+
+```bash
+cat policies/payment.yaml policies/security.yaml > production.yaml
+```
+
+### Large Policies (50+ Rules)
+
+Use policy packs:
+
+```
+policies/
+  core.yaml           # foundational rules
+  packs/
+    stripe.yaml       # Stripe-specific rules
+    shell.yaml        # Shell governance
+    pii.yaml          # PII handling
+  production.yaml     # imports packs
+```
+
+## Testing Strategy
+
+### Unit Tests
+
+Test individual rules in isolation:
+
+```bash
+# Test defer-high-value-refund
+faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":600}'
+
+# Test permit-normal-refund
+faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":100}'
+```
+
+### Integration Tests
+
+Test rule interactions:
+
+```bash
+# Test catch-all after specific rules
+faramesh policy test policy.yaml --tool unknown/tool --args '{}'
+```
+
+### CI Tests
+
+Run on every commit:
+
+```yaml .github/workflows/policy.yml
+- name: Validate policies
+  run: faramesh policy validate policies/*.yaml
+
+- name: Test critical rules
+  run: |
+    faramesh policy test policies/production.yaml --tool stripe/refund --args '{"amount":600}'
+    faramesh policy test policies/production.yaml --tool shell/run --args '{"cmd":"rm -rf /"}'
+```
+
+## Versioning
+
+Version policies in Git:
+
+```bash
+git tag -a policy-v1.2.0 -m "Add weekend operation controls"
+git push origin policy-v1.2.0
+```
+
+Reference in deployments:
+
+```bash
+# Deploy specific version
+git checkout policy-v1.2.0
+cp policies/production.yaml /etc/faramesh/policy.yaml
+faramesh policy reload
+```
+
+## Monitoring
+
+Track key metrics after deploying policy changes:
+
+- **Deny rate**: `sum(effect=DENY) / sum(calls)`
+- **Defer rate**: `sum(effect=DEFER) / sum(calls)`
+- **Top denied rules**: `group_by(rule_id) where effect=DENY`
+- **Deferred decision time**: `avg(defer_resolution_seconds)`
+
+Set alerts:
+
+```yaml
+# Alert if deny rate spikes
+alert: DenyRateHigh
+expr: rate(policy_deny_total[5m]) > 0.1
+message: Policy deny rate > 10%
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Writing Policies" icon="pen-to-square" href="/policies/writing-policies">
+    Policy authoring guide
+  </Card>
+  <Card title="Policy Schema" icon="file-code" href="/policies/policy-schema">
+    Complete YAML reference
+  </Card>
+  <Card title="Expressions" icon="function" href="/policies/expressions">
+    expr-lang syntax
+  </Card>
+  <Card title="Testing" icon="flask" href="/policies/testing">
+    Validate and test policies
+  </Card>
+</CardGroup>

@@ -1,0 +1,388 @@
+---
+title: Sidecar Deployment
+description: Deploy Faramesh as a Kubernetes sidecar or proxy
+---
+
+## Overview
+
+Faramesh supports multiple sidecar deployment patterns:
+
+1. **Unix Socket Sidecar** — Daemon + agent share a volume (recommended)
+2. **gRPC Sidecar** — Daemon exposes gRPC on localhost
+3. **HTTP Proxy Sidecar** — External authorization for API gateways
+4. **MCP Gateway Sidecar** — Transparent MCP tool governance
+
+## Unix Socket Sidecar (Recommended)
+
+The simplest and most secure pattern: daemon and agent share a Unix socket volume.
+
+### Kubernetes Example
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: payment-bot
+spec:
+  volumes:
+    - name: faramesh-socket
+      emptyDir: {}
+    - name: faramesh-data
+      emptyDir: {}
+    - name: policy
+      configMap:
+        name: faramesh-policy
+
+  containers:
+    # Main agent container
+    - name: agent
+      image: myorg/payment-bot:latest
+      env:
+        - name: FARAMESH_SOCKET
+          value: /var/run/faramesh/faramesh.sock
+      volumeMounts:
+        - name: faramesh-socket
+          mountPath: /var/run/faramesh
+
+    # Faramesh daemon sidecar
+    - name: faramesh
+      image: faramesh/faramesh:latest
+      args:
+        - serve
+        - --policy=/etc/faramesh/policy.yaml
+        - --socket=/var/run/faramesh/faramesh.sock
+        - --data-dir=/var/lib/faramesh
+        - --metrics-port=9108
+      volumeMounts:
+        - name: faramesh-socket
+          mountPath: /var/run/faramesh
+        - name: faramesh-data
+          mountPath: /var/lib/faramesh
+        - name: policy
+          mountPath: /etc/faramesh
+      ports:
+        - name: metrics
+          containerPort: 9108
+```
+
+### ConfigMap for Policy
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: faramesh-policy
+data:
+  policy.yaml: |
+    faramesh-version: "1.0"
+    agent-id: "payment-bot"
+    rules:
+      - id: defer-stripe-high-value
+        match:
+          tool: "stripe/refund"
+          when: "args.amount > 500"
+        effect: defer
+        reason: "Refund over $500 requires approval"
+```
+
+## gRPC Sidecar
+
+For multi-process scenarios or when Unix sockets aren't available.
+
+### Daemon Configuration
+
+```bash
+faramesh serve \
+  --policy /etc/faramesh/policy.yaml \
+  --grpc-port 50051 \
+  --data-dir /var/lib/faramesh
+```
+
+See [daemon/server.go:250-263](https://github.com/faramesh/faramesh-core/blob/main/internal/adapter/daemon/server.go:250-263) for gRPC server implementation.
+
+### Kubernetes Example
+
+```yaml
+containers:
+  - name: faramesh
+    image: faramesh/faramesh:latest
+    args:
+      - serve
+      - --policy=/etc/faramesh/policy.yaml
+      - --grpc-port=50051
+    ports:
+      - name: grpc
+        containerPort: 50051
+
+  - name: agent
+    image: myorg/agent:latest
+    env:
+      - name: FARAMESH_GRPC_ADDR
+        value: localhost:50051
+```
+
+### gRPC Client SDK
+
+Connect to the gRPC sidecar:
+
+```python
+from faramesh import FarameshGRPC
+
+client = FarameshGRPC(addr="localhost:50051")
+decision = client.govern(
+    agent_id="my-agent",
+    tool_id="stripe/refund",
+    args={"amount": 1000}
+)
+```
+
+## HTTP Proxy Sidecar
+
+Deploy Faramesh as an external authorization service for Envoy, Kong, or AWS API Gateway.
+
+### Daemon Configuration
+
+```bash
+faramesh serve \
+  --policy /etc/faramesh/policy.yaml \
+  --proxy-port 8080
+```
+
+See [proxy/server.go:67-111](https://github.com/faramesh/faramesh-core/blob/main/internal/adapter/proxy/server.go:67-111) for HTTP proxy implementation.
+
+### Envoy Integration
+
+Configure Envoy to call Faramesh before forwarding requests:
+
+```yaml
+http_filters:
+  - name: envoy.filters.http.ext_authz
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+      http_service:
+        server_uri:
+          uri: http://localhost:8080
+          cluster: faramesh
+          timeout: 0.25s
+        path_prefix: /v1/authorize
+```
+
+### Kong Plugin
+
+Use Kong's external authorization plugin:
+
+```yaml
+plugins:
+  - name: external-auth
+    config:
+      http_service:
+        url: http://localhost:8080/v1/authorize
+```
+
+### Authorization Request
+
+```json
+POST /v1/authorize
+{
+  "agent_id": "payment-bot",
+  "session_id": "sess-123",
+  "tool_id": "stripe/refund",
+  "args": {"amount": 500, "customer_id": "cust_abc"}
+}
+```
+
+### Authorization Response
+
+```json
+{
+  "effect": "PERMIT",
+  "rule_id": "rule-003",
+  "reason_code": "RULE_PERMIT",
+  "latency_ms": 8,
+  "policy_version": "abc123"
+}
+```
+
+See [proxy/server.go:141-223](https://github.com/faramesh/faramesh-core/blob/main/internal/adapter/proxy/server.go:141-223) for request/response format.
+
+## MCP Gateway Sidecar
+
+Transparent governance for MCP (Model Context Protocol) servers.
+
+### HTTP MCP Gateway
+
+Proxy MCP-over-HTTP requests:
+
+```bash
+faramesh serve \
+  --policy /etc/faramesh/policy.yaml \
+  --mcp-proxy-port 8090 \
+  --mcp-target http://upstream-mcp-server:3000
+```
+
+See [mcp/gateway.go:258-286](https://github.com/faramesh/faramesh-core/blob/main/internal/adapter/mcp/gateway.go:258-286) for MCP HTTP gateway.
+
+### Kubernetes MCP Sidecar
+
+```yaml
+containers:
+  - name: mcp-server
+    image: myorg/mcp-server:latest
+    ports:
+      - containerPort: 3000
+
+  - name: faramesh-mcp-gateway
+    image: faramesh/faramesh:latest
+    args:
+      - serve
+      - --policy=/etc/faramesh/policy.yaml
+      - --mcp-proxy-port=8090
+      - --mcp-target=http://localhost:3000
+    ports:
+      - name: mcp-gateway
+        containerPort: 8090
+```
+
+Clients connect to the gateway (`localhost:8090`) instead of the real server.
+
+### Stdio MCP Gateway
+
+Wrap any stdio MCP server:
+
+```bash
+faramesh mcp wrap -- node mcp-server.js
+```
+
+See [mcp/gateway.go:74-124](https://github.com/faramesh/faramesh-core/blob/main/internal/adapter/mcp/gateway.go:74-124) for stdio gateway implementation.
+
+## Deployment Patterns
+
+### Per-Pod Sidecar
+
+**Use when:** Each agent has unique governance requirements
+
+```
+┌─────────────────────────┐
+│  Pod: payment-bot       │
+│  ┌────────┐  ┌────────┐ │
+│  │ Agent  │  │Faramesh│ │
+│  └────────┘  └────────┘ │
+└─────────────────────────┘
+```
+
+### Shared Daemon (DaemonSet)
+
+**Use when:** Multiple agents share the same policy
+
+```
+┌────────────────────────────┐
+│  Node                      │
+│  ┌────┐  ┌────┐  ┌────┐   │
+│  │Bot1│  │Bot2│  │Bot3│   │
+│  └─┬──┘  └─┬──┘  └─┬──┘   │
+│    └────────┴────────┘     │
+│           │                │
+│      ┌────▼─────┐          │
+│      │ Faramesh │          │
+│      │ (DaemonSet)         │
+│      └──────────┘          │
+└────────────────────────────┘
+```
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: faramesh
+spec:
+  selector:
+    matchLabels:
+      app: faramesh
+  template:
+    metadata:
+      labels:
+        app: faramesh
+    spec:
+      containers:
+        - name: faramesh
+          image: faramesh/faramesh:latest
+          args:
+            - serve
+            - --policy=/etc/faramesh/policy.yaml
+            - --socket=/var/run/faramesh.sock
+          volumeMounts:
+            - name: socket
+              mountPath: /var/run
+      volumes:
+        - name: socket
+          hostPath:
+            path: /var/run
+```
+
+<Warning>
+DaemonSet pattern requires careful socket path coordination between the daemon and all agent pods on the node.
+</Warning>
+
+## Health Checks
+
+### Liveness Probe (Unix Socket)
+
+```yaml
+livenessProbe:
+  exec:
+    command:
+      - /bin/sh
+      - -c
+      - test -S /var/run/faramesh/faramesh.sock
+  initialDelaySeconds: 5
+  periodSeconds: 10
+```
+
+### Readiness Probe (HTTP Proxy)
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  initialDelaySeconds: 3
+  periodSeconds: 5
+```
+
+### Metrics Collection
+
+Scrape Prometheus metrics:
+
+```yaml
+annotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9108"
+  prometheus.io/path: "/metrics"
+```
+
+## Resource Limits
+
+Recommended resource requests/limits:
+
+```yaml
+resources:
+  requests:
+    memory: "128Mi"
+    cpu: "100m"
+  limits:
+    memory: "512Mi"
+    cpu: "500m"
+```
+
+Faramesh is lightweight — average latency is &lt;1ms per decision.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Production Setup" icon="server" href="/deployment/production">
+    High availability and persistence strategies
+  </Card>
+  <Card title="Monitoring" icon="chart-line" href="/deployment/monitoring">
+    Metrics, logs, and observability
+  </Card>
+</CardGroup>

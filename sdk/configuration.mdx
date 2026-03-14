@@ -1,0 +1,378 @@
+---
+title: "SDK Configuration"
+description: "Configure the Faramesh Python SDK daemon path, socket location, timeouts, and environment variables"
+icon: "gear"
+---
+
+## Overview
+
+The Faramesh Python SDK can be configured via:
+
+1. **`govern()` decorator parameters** — Per-function configuration
+2. **Environment variables** — Process-wide configuration
+3. **Daemon CLI flags** — When starting the daemon manually
+
+## Decorator parameters
+
+All configuration options can be set directly in the `govern()` decorator:
+
+```python
+from faramesh import govern
+
+@govern(
+    policy="policies/production.yaml",
+    agent_id="customer-service-bot",
+    tool_id="refund_order",
+    socket_path="/var/run/faramesh/faramesh.sock",
+    auto_start=False
+)
+def refund_order(order_id: str, amount: float):
+    pass
+```
+
+See the [govern() decorator reference](/sdk/govern-decorator) for full parameter details.
+
+## Environment variables
+
+### `FARAMESH_CACHE_DIR`
+
+Directory where the daemon binary is cached after download.
+
+- **Default:** `~/.faramesh/bin/`
+- **Type:** Path (absolute or relative)
+
+```bash
+export FARAMESH_CACHE_DIR="/opt/faramesh/bin"
+python my_agent.py
+```
+
+The SDK downloads the appropriate platform binary (Linux, macOS, Windows; x86_64 or ARM64) to this directory on first use.
+
+### Custom environment variables
+
+You can also use environment variables to set default values for `govern()` parameters in your own code:
+
+```python
+import os
+from faramesh import govern
+
+DEFAULT_SOCKET = os.getenv("FARAMESH_SOCKET", "/tmp/faramesh.sock")
+DEFAULT_POLICY = os.getenv("FARAMESH_POLICY", "policy.yaml")
+
+@govern(socket_path=DEFAULT_SOCKET, policy=DEFAULT_POLICY)
+def my_tool():
+    pass
+```
+
+Then configure via environment:
+
+```bash
+export FARAMESH_SOCKET="/var/run/faramesh.sock"
+export FARAMESH_POLICY="policies/prod.yaml"
+python my_agent.py
+```
+
+## Daemon configuration
+
+When starting the daemon manually (production mode with `auto_start=False`), configure it via CLI flags.
+
+### Basic daemon startup
+
+```bash
+faramesh serve \
+  --policy policy.yaml \
+  --socket /tmp/faramesh.sock \
+  --data-dir /var/lib/faramesh
+```
+
+### Daemon CLI flags
+
+| Flag | Description | Default |
+|------|-------------|--------|
+| `--policy` | Path to the policy YAML file | (required) |
+| `--socket` | Unix socket path | `/tmp/faramesh.sock` |
+| `--data-dir` | Directory for audit logs and state | `./faramesh-data` |
+| `--log-level` | Log level (debug, info, warn, error) | `info` |
+| `--metrics-addr` | Address for Prometheus metrics | (disabled) |
+
+### Example: Production daemon
+
+```bash
+faramesh serve \
+  --policy /etc/faramesh/policy.yaml \
+  --socket /var/run/faramesh/faramesh.sock \
+  --data-dir /var/lib/faramesh \
+  --log-level info \
+  --metrics-addr :9090
+```
+
+See [Deployment](/deployment/daemon) for production setup guides (systemd, Docker, Kubernetes).
+
+## Socket path configuration
+
+The socket path determines where the SDK connects to the daemon. This must match between the daemon and the SDK.
+
+### Development (default)
+
+```python
+# SDK uses /tmp/faramesh.sock by default
+@govern
+def my_tool():
+    pass
+```
+
+```bash
+# Daemon auto-started with same default
+# No manual configuration needed
+```
+
+### Production (custom socket)
+
+```python
+# SDK configured with custom socket
+@govern(socket_path="/var/run/faramesh/faramesh.sock", auto_start=False)
+def my_tool():
+    pass
+```
+
+```bash
+# Start daemon with matching socket
+faramesh serve \
+  --policy policy.yaml \
+  --socket /var/run/faramesh/faramesh.sock
+```
+
+## Timeouts
+
+### Daemon connection timeout
+
+The SDK waits up to **5 seconds** to connect to the daemon socket. This is hardcoded in `client.py:17`:
+
+```python
+CONNECT_TIMEOUT = 5.0  # seconds
+```
+
+If the daemon doesn't respond within 5s, a `DaemonError` is raised.
+
+### DEFER polling interval
+
+When a tool call is deferred (`DEFER` effect), the SDK polls the daemon every **2 seconds** to check if approval has been granted:
+
+```python
+POLL_INTERVAL = 2.0  # seconds
+```
+
+This is hardcoded in `client.py:16`.
+
+### DEFER timeout
+
+The SDK blocks for up to **300 seconds (5 minutes)** waiting for approval. This is hardcoded in `client.py:79`:
+
+```python
+def wait_for_defer(
+    self,
+    agent_id: str,
+    defer_token: str,
+    timeout: float = 300.0,  # 5 minutes
+) -> str:
+    ...
+```
+
+If approval doesn't arrive within 5 minutes, a `DeferredError` is raised with `expired=True`.
+
+### Custom DEFER timeout (advanced)
+
+You can modify the timeout by using `FarameshClient` directly:
+
+```python
+from faramesh.client import FarameshClient
+
+client = FarameshClient(socket_path="/tmp/faramesh.sock")
+
+# Wait up to 10 minutes for approval
+status = client.wait_for_defer(
+    agent_id="my-agent",
+    defer_token="def_abc123",
+    timeout=600.0  # 10 minutes
+)
+```
+
+However, the `govern()` decorator uses the default 5-minute timeout. To customize it, you'd need to fork the SDK or submit a PR to make it configurable.
+
+## Auto-start behavior
+
+### Development mode (auto-start enabled)
+
+When `auto_start=True` (default), the SDK:
+
+1. Checks if the socket already exists
+2. If not, downloads the daemon binary (if not cached)
+3. Starts the daemon as a subprocess
+4. Waits up to 3 seconds for the socket to appear
+5. Raises `RuntimeError` if the daemon exits immediately or the socket doesn't appear
+
+```python
+@govern(auto_start=True)  # Default
+def my_tool():
+    pass
+
+# First call triggers daemon download and startup
+my_tool()
+```
+
+The daemon runs as a subprocess in the background. It's **not** automatically stopped when your process exits.
+
+### Production mode (auto-start disabled)
+
+When `auto_start=False`, the SDK assumes the daemon is already running:
+
+```python
+@govern(auto_start=False)
+def my_tool():
+    pass
+```
+
+You must start the daemon manually before calling any governed functions:
+
+```bash
+faramesh serve --policy policy.yaml --socket /tmp/faramesh.sock
+```
+
+If the daemon isn't running, a `DaemonError` is raised on the first call.
+
+## Binary download and caching
+
+### Supported platforms
+
+The SDK automatically downloads the correct binary for your platform:
+
+| OS | Architecture | Platform Tag |
+|---------|--------------|-------------|
+| Linux | x86_64 | `linux-amd64` |
+| Linux | ARM64 | `linux-arm64` |
+| macOS | x86_64 | `darwin-amd64` |
+| macOS | ARM64 | `darwin-arm64` |
+| Windows | x86_64 | `windows-amd64` |
+
+### Cache location
+
+Binaries are cached in:
+
+```
+~/.faramesh/bin/faramesh-{version}-{platform}
+```
+
+Example:
+
+```
+~/.faramesh/bin/faramesh-0.1.0-linux-amd64
+```
+
+Set `FARAMESH_CACHE_DIR` to change the cache location.
+
+### Manual binary installation
+
+If auto-download fails (firewall, offline environment, etc.), install the binary manually:
+
+```bash
+curl -L https://github.com/faramesh/faramesh-core/releases/download/v0.1.0/faramesh-linux-amd64 \
+  -o ~/.faramesh/bin/faramesh-0.1.0-linux-amd64
+chmod +x ~/.faramesh/bin/faramesh-0.1.0-linux-amd64
+```
+
+Or install system-wide and disable auto-start:
+
+```bash
+# Install to /usr/local/bin
+curl -L https://github.com/faramesh/faramesh-core/releases/download/v0.1.0/faramesh-linux-amd64 \
+  -o /usr/local/bin/faramesh
+chmod +x /usr/local/bin/faramesh
+```
+
+Then start manually:
+
+```bash
+faramesh serve --policy policy.yaml
+```
+
+And configure the SDK:
+
+```python
+@govern(auto_start=False)
+def my_tool():
+    pass
+```
+
+## Session management
+
+The SDK automatically creates a unique **session ID** for each process:
+
+```python
+_session_id: str = str(uuid.uuid4())
+```
+
+All tool calls within the same Python process share this session ID. This allows the policy engine to:
+
+- Track related tool calls (e.g., "allow 5 refunds per session")
+- Correlate audit logs across multiple tools
+- Implement session-scoped rate limits
+
+The session ID is automatically included in every governance request.
+
+## Client instance management
+
+The SDK uses a **global shared client** for all governed functions within a process:
+
+```python
+_client: FarameshClient | None = None
+
+def _get_client(socket_path: str) -> FarameshClient:
+    global _client
+    if _client is None or _client.socket_path != socket_path:
+        _client = FarameshClient(socket_path=socket_path)
+    return _client
+```
+
+This means:
+- All governed functions share a single socket connection pool
+- The client is thread-safe (uses internal locking)
+- If you change the socket path, a new client is created
+
+## Configuration example: Multi-environment
+
+```python
+import os
+from faramesh import govern
+
+# Environment-based configuration
+ENV = os.getenv("ENV", "development")
+
+if ENV == "production":
+    POLICY = "/etc/faramesh/policy.yaml"
+    SOCKET = "/var/run/faramesh/faramesh.sock"
+    AUTO_START = False
+else:
+    POLICY = "policy.yaml"
+    SOCKET = "/tmp/faramesh.sock"
+    AUTO_START = True
+
+@govern(policy=POLICY, socket_path=SOCKET, auto_start=AUTO_START)
+def my_tool():
+    pass
+```
+
+Usage:
+
+```bash
+# Development: auto-starts daemon
+python my_agent.py
+
+# Production: expects daemon to be running
+ENV=production python my_agent.py
+```
+
+## See also
+
+- [govern() decorator](/sdk/govern-decorator) — Full parameter reference
+- [Deployment](/deployment/daemon) — Production daemon setup
+- [Policy reference](/policies/writing-policies) — Configure governance rules

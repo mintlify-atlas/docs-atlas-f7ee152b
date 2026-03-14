@@ -1,0 +1,449 @@
+---
+title: Monitoring & Observability
+description: Metrics, logs, and OpenTelemetry integration for Faramesh
+---
+
+## Overview
+
+Faramesh provides comprehensive observability through:
+
+1. **Prometheus Metrics** — Governance decisions, latency, WAL writes, incidents prevented
+2. **Structured Logs** — JSON logs via zap, filtered by level
+3. **OpenTelemetry Traces** — Distributed tracing for governance pipeline
+4. **Audit Stream** — Real-time governance decision feed
+
+## Prometheus Metrics
+
+### Enable Metrics Endpoint
+
+```bash
+faramesh serve \
+  --policy policy.yaml \
+  --metrics-port 9108
+```
+
+Metrics available at: `http://localhost:9108/metrics`
+
+See [observe/metrics.go:159-207](https://github.com/faramesh/faramesh-core/blob/main/internal/core/observe/metrics.go:159-207) for metrics handler implementation.
+
+### Key Metrics
+
+#### Decision Counters
+
+```prometheus
+# Total governance decisions by effect
+faramesh_decisions_total{effect="permit"} 1523
+faramesh_decisions_total{effect="deny"} 47
+faramesh_decisions_total{effect="defer"} 12
+faramesh_decisions_total{effect="shadow"} 0
+
+# Deny reasons breakdown
+faramesh_deny_reasons_total{reason_code="RULE_DENY_SHELL"} 23
+faramesh_deny_reasons_total{reason_code="DEFAULT_DENY"} 24
+```
+
+See [observe/metrics.go:64-77](https://github.com/faramesh/faramesh-core/blob/main/internal/core/observe/metrics.go:64-77) for decision recording.
+
+#### Latency Histogram
+
+```prometheus
+# Decision latency distribution (seconds)
+faramesh_decision_latency_seconds_bucket{le="0.0001"} 1234  # ≤100μs
+faramesh_decision_latency_seconds_bucket{le="0.001"} 1520   # ≤1ms
+faramesh_decision_latency_seconds_bucket{le="0.01"} 1582   # ≤10ms
+faramesh_decision_latency_seconds_sum 1.523
+faramesh_decision_latency_seconds_count 1582
+```
+
+Average latency: **&lt;1ms per decision**
+
+See [observe/metrics.go:90-101](https://github.com/faramesh/faramesh-core/blob/main/internal/core/observe/metrics.go:90-101) for latency recording.
+
+#### WAL Writes
+
+```prometheus
+# Write-Ahead Log persistence
+faramesh_wal_writes_total{status="success"} 1582
+faramesh_wal_writes_total{status="error"} 0
+```
+
+#### Context Guards
+
+```prometheus
+# Context guard checks
+faramesh_context_checks_total{result="pass"} 1450
+faramesh_context_checks_total{result="fail"} 132
+```
+
+#### Incident Prevention
+
+```prometheus
+# Incidents prevented by category and severity
+faramesh_incidents_prevented_total{category_severity="execution:high"} 23
+faramesh_incidents_prevented_total{category_severity="data_breach:critical"} 5
+
+# Incidents prevented per 1000 governance calls
+faramesh_incidents_prevented_per_1k_calls 18.2
+
+# Shadow mode incident exposure (would have happened)
+faramesh_shadow_mode_incident_exposure 7
+```
+
+See [observe/metrics.go:137-156](https://github.com/faramesh/faramesh-core/blob/main/internal/core/observe/metrics.go:137-156) for incident metrics.
+
+#### Active Sessions
+
+```prometheus
+# Number of active agent sessions
+faramesh_active_sessions 12
+```
+
+### Prometheus Scrape Configuration
+
+```yaml
+scrape_configs:
+  - job_name: 'faramesh'
+    static_configs:
+      - targets: ['localhost:9108']
+    scrape_interval: 15s
+```
+
+### Kubernetes ServiceMonitor
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: faramesh
+spec:
+  selector:
+    matchLabels:
+      app: faramesh
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+```
+
+### Grafana Dashboard
+
+Key panels:
+
+1. **Decision Rate** — `rate(faramesh_decisions_total[5m])`
+2. **Deny Rate** — `rate(faramesh_decisions_total{effect="deny"}[5m])`
+3. **P99 Latency** — `histogram_quantile(0.99, rate(faramesh_decision_latency_seconds_bucket[5m]))`
+4. **Incidents Prevented** — `faramesh_incidents_prevented_per_1k_calls`
+5. **WAL Error Rate** — `rate(faramesh_wal_writes_total{status="error"}[5m])`
+
+## Structured Logs
+
+### Log Levels
+
+```bash
+# Production: info (default)
+faramesh serve --policy policy.yaml --log-level info
+
+# Development: debug
+faramesh serve --policy policy.yaml --log-level debug
+
+# Quiet: warn or error
+faramesh serve --policy policy.yaml --log-level warn
+```
+
+See [serve.go:110-123](https://github.com/faramesh/faramesh-core/blob/main/cmd/faramesh/serve.go:110-123) for log level configuration.
+
+### Log Format
+
+JSON-structured logs via [zap](https://github.com/uber-go/zap):
+
+```json
+{
+  "level": "info",
+  "ts": 1710432000.123,
+  "caller": "daemon/daemon.go:89",
+  "msg": "faramesh daemon running",
+  "socket": "/tmp/faramesh.sock",
+  "policy": "policy.yaml",
+  "data_dir": "/var/lib/faramesh"
+}
+```
+
+### Key Log Events
+
+#### Daemon Startup
+
+```json
+{"level":"info","msg":"policy loaded","version":"abc123","agent_id":"payment-bot","rules":5}
+{"level":"info","msg":"faramesh daemon running","socket":"/tmp/faramesh.sock"}
+```
+
+#### Policy Reload
+
+```json
+{"level":"info","msg":"SIGHUP received — reloading policy","path":"policy.yaml"}
+{"level":"info","msg":"policy reloaded","version":"def456","rules":7}
+```
+
+#### Governance Decisions
+
+```json
+{"level":"info","msg":"proxy authorized","agent":"payment-bot","tool":"stripe/refund","effect":"PERMIT","latency":"0.8ms"}
+{"level":"info","msg":"mcp tool governed","tool":"filesystem/delete","effect":"DENY","latency":"0.5ms"}
+```
+
+#### Horizon Sync
+
+```json
+{"level":"info","msg":"horizon sync enabled","org":"Acme Corp","user":"admin@acme.com"}
+```
+
+### Centralized Logging
+
+#### Kubernetes (stdout/stderr)
+
+Logs are automatically captured by Kubernetes and sent to your logging backend (Loki, Elasticsearch, etc.).
+
+#### systemd Journal
+
+```bash
+journalctl -u faramesh -f --output=json
+```
+
+#### Docker Compose (JSON File Driver)
+
+```yaml
+services:
+  faramesh:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+```
+
+## OpenTelemetry Traces
+
+Faramesh supports distributed tracing for the governance pipeline.
+
+### Enable OTel Tracing
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+export OTEL_SERVICE_NAME=faramesh-daemon
+faramesh serve --policy policy.yaml
+```
+
+See [observe/otel.go:76-82](https://github.com/faramesh/faramesh-core/blob/main/internal/core/observe/otel.go:76-82) for tracer configuration.
+
+### Span Structure
+
+Each governance request creates a trace:
+
+```
+faramesh.govern (SpanKindServer)
+├── faramesh.policy_eval (SpanKindInternal)
+├── faramesh.dpr_write (SpanKindClient)
+└── faramesh.defer (SpanKindInternal, if DEFER)
+```
+
+See [observe/otel.go:215-243](https://github.com/faramesh/faramesh-core/blob/main/internal/core/observe/otel.go:215-243) for span helpers.
+
+### Span Attributes
+
+```
+faramesh.agent_id = "payment-bot"
+faramesh.tool_id = "stripe/refund"
+faramesh.rule_count = 5
+faramesh.dpr_record_id = "dpr_1234567890"
+faramesh.defer_token = "def_abc123"
+```
+
+### Jaeger Integration
+
+```bash
+# Run Jaeger locally
+docker run -d --name jaeger \
+  -p 4318:4318 \
+  -p 16686:16686 \
+  jaegertracing/all-in-one:latest
+
+# Configure Faramesh
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+faramesh serve --policy policy.yaml
+
+# View traces
+open http://localhost:16686
+```
+
+## Real-Time Audit Stream
+
+Stream live governance decisions:
+
+```bash
+faramesh audit tail
+```
+
+Output:
+
+```
+2026-03-14T10:23:45Z  PERMIT  payment-bot  stripe/refund  rule-003  0.8ms
+2026-03-14T10:23:47Z  DENY    payment-bot  shell/exec     rule-007  0.5ms
+2026-03-14T10:23:50Z  DEFER   payment-bot  stripe/refund  rule-005  1.2ms
+```
+
+Filter by agent:
+
+```bash
+faramesh audit tail --agent payment-bot
+```
+
+## Alerting Rules
+
+### Prometheus Alertmanager
+
+```yaml
+groups:
+  - name: faramesh
+    interval: 30s
+    rules:
+      # High deny rate
+      - alert: HighDenyRate
+        expr: rate(faramesh_decisions_total{effect="deny"}[5m]) > 10
+        for: 5m
+        annotations:
+          summary: "High governance deny rate"
+          description: "Faramesh is denying >10 actions/sec for 5 minutes"
+
+      # WAL write failures
+      - alert: WALWriteFailures
+        expr: rate(faramesh_wal_writes_total{status="error"}[1m]) > 0
+        for: 1m
+        annotations:
+          summary: "WAL write failures detected"
+          description: "Faramesh WAL writes are failing — audit log integrity at risk"
+
+      # High latency
+      - alert: HighGovernanceLatency
+        expr: histogram_quantile(0.99, rate(faramesh_decision_latency_seconds_bucket[5m])) > 0.01
+        for: 5m
+        annotations:
+          summary: "High governance latency (P99 >10ms)"
+          description: "Faramesh P99 latency is above 10ms"
+
+      # Shadow mode incidents
+      - alert: ShadowModeIncidents
+        expr: increase(faramesh_shadow_mode_incident_exposure[1h]) > 5
+        annotations:
+          summary: "Shadow mode detected potential incidents"
+          description: "5+ incidents would have occurred without governance"
+```
+
+### Slack Notifications
+
+For DEFER decisions:
+
+```bash
+faramesh serve \
+  --policy policy.yaml \
+  --slack-webhook "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+```
+
+When a DEFER occurs, Faramesh sends:
+
+```
+🚨 Action requires approval
+Agent: payment-bot
+Tool: stripe/refund
+Reason: Refund over $500 requires approval
+Approve: faramesh agent approve def_abc123
+```
+
+## Health Checks
+
+### HTTP Proxy Health Endpoint
+
+```bash
+curl http://localhost:8080/healthz
+{"status":"ok"}
+```
+
+See [proxy/server.go:83-86](https://github.com/faramesh/faramesh-core/blob/main/internal/adapter/proxy/server.go:83-86) for health endpoint.
+
+### gRPC Health Check
+
+```bash
+grpc_health_probe -addr=localhost:50051
+status: SERVING
+```
+
+See [daemon/server.go:69-72](https://github.com/faramesh/faramesh-core/blob/main/internal/adapter/daemon/server.go:69-72) for gRPC health service.
+
+### Socket Liveness Check
+
+```bash
+test -S /tmp/faramesh.sock && echo "alive" || echo "dead"
+```
+
+## Performance Monitoring
+
+### Decision Throughput
+
+```promql
+rate(faramesh_decisions_total[5m])
+```
+
+### Average Latency
+
+```promql
+rate(faramesh_decision_latency_seconds_sum[5m]) /
+rate(faramesh_decision_latency_seconds_count[5m])
+```
+
+### Policy Effectiveness
+
+```promql
+# Percentage of decisions that are DENY
+100 * rate(faramesh_decisions_total{effect="deny"}[5m]) /
+rate(faramesh_decisions_total[5m])
+```
+
+### Resource Usage
+
+```promql
+# CPU usage
+rate(process_cpu_seconds_total{job="faramesh"}[5m])
+
+# Memory usage
+process_resident_memory_bytes{job="faramesh"}
+```
+
+## Observability Best Practices
+
+<AccordionGroup>
+  <Accordion title="Set up alerting on WAL write failures">
+    WAL failures indicate audit log integrity issues. Alert immediately and investigate.
+  </Accordion>
+  <Accordion title="Monitor incidents prevented per 1k calls">
+    This metric shows governance effectiveness. Track trends over time.
+  </Accordion>
+  <Accordion title="Watch for high DEFER rates">
+    Excessive DEFERs may indicate policy is too restrictive or needs refinement.
+  </Accordion>
+  <Accordion title="Track P99 latency">
+    Faramesh should add &lt;1ms overhead. If P99 &gt;10ms, investigate.
+  </Accordion>
+  <Accordion title="Enable structured logging in production">
+    JSON logs integrate seamlessly with Loki, Elasticsearch, CloudWatch, etc.
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Troubleshooting" icon="wrench" href="/deployment/troubleshooting">
+    Common issues and solutions
+  </Card>
+  <Card title="Production Setup" icon="server" href="/deployment/production">
+    High availability and persistence
+  </Card>
+</CardGroup>

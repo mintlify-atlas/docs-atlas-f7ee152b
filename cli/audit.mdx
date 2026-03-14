@@ -1,0 +1,449 @@
+---
+title: 'faramesh audit'
+description: 'Audit trail commands: tail, verify, export, and analyze DPR records'
+---
+
+## Overview
+
+The `faramesh audit` command group provides tools for working with the Decision Provenance Record (DPR) audit trail.
+
+## Commands
+
+- **`tail`** — Stream live governance decisions
+- **`verify`** — Verify DPR chain integrity
+- **`export`** — Export records for compliance (JSON, CSV, JSONL)
+- **`stats`** — Show aggregate statistics
+
+---
+
+## faramesh audit tail
+
+Stream live governance decisions from a running daemon.
+
+### Usage
+```bash
+faramesh audit tail
+```
+
+### Flags
+
+<ParamField path="--agent" type="string">
+  Filter by agent ID (empty = all agents)
+</ParamField>
+
+<ParamField path="--socket" type="string" default="/tmp/faramesh.sock">
+  Daemon Unix socket path
+</ParamField>
+
+### What It Does
+1. Connects to running daemon
+2. Subscribes to decision stream
+3. Prints each decision with color-coded effects
+4. Shows tool, agent, rule, and latency
+
+### Example Output
+
+```bash
+$ faramesh audit tail
+
+Faramesh Audit Tail — streaming decisions (Ctrl+C to stop)
+
+[15:04:05] PERMIT  get_exchange_rate      payment-bot       latency=1ms
+[15:04:05] DENY    shell/run              dev-agent         rule=deny-destructive-shell  2ms
+[15:04:06] DEFER   stripe/refund          payment-bot       rule=defer-high-value  1ms
+[15:04:06] PERMIT  read_customer          crm-agent         latency=1ms
+[15:04:07] DENY    send_email             marketing-agent   rule=deny-bulk-email  2ms
+```
+
+Color-coded:
+- **<span style={{color: 'green'}}>PERMIT</span>** — Green
+- **<span style={{color: 'red'}}>DENY</span>** — Red
+- **<span style={{color: 'yellow'}}>DEFER</span>** — Yellow
+
+### Filter by Agent
+```bash
+$ faramesh audit tail --agent payment-bot
+
+[15:04:05] PERMIT  get_exchange_rate      payment-bot
+[15:04:06] DEFER   stripe/refund          payment-bot
+```
+
+### Use Cases
+
+#### Development
+Watch decisions in real-time while testing:
+```bash
+# Terminal 1
+faramesh serve --policy policy.yaml
+
+# Terminal 2
+faramesh audit tail
+
+# Terminal 3
+python agent.py  # Run your agent
+```
+
+#### Production Monitoring
+Pipe to log aggregator:
+```bash
+faramesh audit tail | tee -a faramesh-audit.log
+```
+
+#### Debugging
+Filter to specific agent:
+```bash
+faramesh audit tail --agent problematic-agent
+```
+
+---
+
+## faramesh audit verify
+
+Verify SHA256 chain integrity of a DPR SQLite store.
+
+### Usage
+```bash
+faramesh audit verify <dpr.db>
+```
+
+### What It Does
+1. Reads all DPR records from SQLite
+2. Recomputes SHA256 hash for each record
+3. Verifies hash chain (each record links to previous)
+4. Reports violations
+
+### Example Output
+
+#### Valid Chain
+```bash
+$ faramesh audit verify /tmp/faramesh/dpr.db
+
+Verifying DPR chain integrity: /tmp/faramesh/dpr.db
+Records to verify: 1,247
+
+✓ Chain integrity verified. 1,247 records, 0 violations.
+```
+
+#### Tampered Chain
+```bash
+$ faramesh audit verify /tmp/faramesh/dpr.db
+
+Verifying DPR chain integrity: /tmp/faramesh/dpr.db
+Records to verify: 1,247
+
+✗ CHAIN VIOLATION record 842: rec_abc123
+✗ CHAIN VIOLATION record 843: rec_def456
+
+✗ 2 chain integrity violation(s) detected.
+```
+
+Exit code 1 on violations.
+
+### Use Cases
+
+#### Compliance Audits
+Verify audit trail hasn't been tampered with:
+```bash
+faramesh audit verify /var/lib/faramesh/dpr.db
+```
+
+#### CI/CD
+Verify integrity before exporting:
+```bash
+faramesh audit verify dpr.db || exit 1
+faramesh audit export dpr.db --format csv > audit.csv
+```
+
+---
+
+## faramesh audit export
+
+Export DPR records for compliance (SOC2, HIPAA, PCI-DSS).
+
+### Usage
+```bash
+faramesh audit export <dpr.db>
+```
+
+### Flags
+
+<ParamField path="--format" type="string" default="json">
+  Output format: `json`, `jsonl`, `csv`
+</ParamField>
+
+<ParamField path="--agent" type="string">
+  Filter by agent ID
+</ParamField>
+
+<ParamField path="--effect" type="string">
+  Filter by effect: `PERMIT`, `DENY`, `DEFER`, `SHADOW`
+</ParamField>
+
+<ParamField path="--since" type="string">
+  Only records after this date (RFC3339 or YYYY-MM-DD)
+</ParamField>
+
+<ParamField path="--limit" type="number" default="10000">
+  Max records to export
+</ParamField>
+
+<ParamField path="--verify" type="boolean" default="false">
+  Verify chain integrity during export
+</ParamField>
+
+### Examples
+
+#### Export as JSON
+```bash
+faramesh audit export dpr.db --format json > audit.json
+```
+
+#### Export as CSV
+```bash
+faramesh audit export dpr.db --format csv > audit.csv
+```
+
+#### Export as JSONL (JSON Lines)
+```bash
+faramesh audit export dpr.db --format jsonl | jq '.effect'
+```
+
+#### Filter by Effect
+```bash
+# Export only DENY decisions
+faramesh audit export dpr.db --effect DENY --format csv > denials.csv
+```
+
+#### Filter by Agent
+```bash
+faramesh audit export dpr.db --agent payment-bot --format json > payment-bot-audit.json
+```
+
+#### Filter by Date
+```bash
+# Records since January 1, 2024
+faramesh audit export dpr.db --since 2024-01-01 --format csv > 2024-audit.csv
+
+# Records since specific timestamp
+faramesh audit export dpr.db --since 2024-01-15T10:30:00Z --format json
+```
+
+#### Verify During Export
+```bash
+faramesh audit export dpr.db --verify --format jsonl
+# WARNING: 0 chain integrity violations detected
+```
+
+#### Limit Records
+```bash
+# Export most recent 1000 records
+faramesh audit export dpr.db --limit 1000 --format csv
+```
+
+### CSV Output Format
+
+Columns:
+- `record_id`
+- `created_at`
+- `agent_id`
+- `session_id`
+- `tool_id`
+- `effect`
+- `matched_rule_id`
+- `reason_code`
+- `reason`
+- `policy_version`
+- `intercept_adapter`
+- `record_hash`
+- `prev_record_hash`
+
+### JSON Output Format
+
+```json
+[
+  {
+    "record_id": "rec_abc123",
+    "created_at": "2024-03-14T15:04:05Z",
+    "agent_id": "payment-bot",
+    "session_id": "sess_xyz789",
+    "tool_id": "stripe/refund",
+    "effect": "DEFER",
+    "matched_rule_id": "defer-high-value",
+    "reason_code": "HIGH_VALUE_THRESHOLD",
+    "reason": "high-value operation requires human approval",
+    "policy_version": "1.0",
+    "intercept_adapter": "sdk",
+    "record_hash": "sha256:abc...",
+    "prev_record_hash": "sha256:def..."
+  }
+]
+```
+
+### Use Cases
+
+#### SOC2 Compliance
+```bash
+# Export quarterly audit trail
+faramesh audit export dpr.db \
+  --since 2024-01-01 \
+  --verify \
+  --format csv > q1-2024-audit.csv
+```
+
+#### Investigate Denials
+```bash
+# Export all DENY decisions for review
+faramesh audit export dpr.db --effect DENY --format json | jq .
+```
+
+#### Agent-Specific Audit
+```bash
+# Export all decisions for a specific agent
+faramesh audit export dpr.db --agent payment-bot --format csv
+```
+
+---
+
+## faramesh audit stats
+
+Show aggregate statistics from the DPR audit trail.
+
+### Usage
+```bash
+faramesh audit stats <dpr.db>
+```
+
+### Example Output
+
+```bash
+$ faramesh audit stats /tmp/faramesh/dpr.db
+
+DPR Audit Statistics — /tmp/faramesh/dpr.db
+  Total records : 1,247
+  Unique agents : 5
+  Unique tools  : 18
+
+  Decisions by effect:
+    PERMIT   847
+    DENY     312
+    DEFER    88
+
+  Top deny reason codes:
+    DESTRUCTIVE_SHELL_COMMAND           89
+    HIGH_VALUE_THRESHOLD                45
+    BULK_OPERATION                      38
+    UNAPPROVED_TOOL                     27
+    RATE_LIMIT_EXCEEDED                 15
+    ...
+```
+
+### Use Cases
+
+#### Quick Health Check
+```bash
+# How many denials vs permits?
+faramesh audit stats dpr.db
+```
+
+#### Identify Top Issues
+```bash
+# What are agents being blocked for?
+faramesh audit stats dpr.db | grep "Top deny reason codes" -A 10
+```
+
+---
+
+## Common Workflows
+
+### Development Workflow
+```bash
+# Terminal 1: Start daemon
+faramesh serve --policy policy.yaml
+
+# Terminal 2: Stream live decisions
+faramesh audit tail
+
+# Terminal 3: Run agent
+python agent.py
+```
+
+### Compliance Export Workflow
+```bash
+# 1. Verify integrity
+faramesh audit verify /var/lib/faramesh/dpr.db
+
+# 2. Export for compliance period
+faramesh audit export /var/lib/faramesh/dpr.db \
+  --since 2024-01-01 \
+  --format csv \
+  --verify > q1-2024-audit.csv
+
+# 3. Generate stats summary
+faramesh audit stats /var/lib/faramesh/dpr.db > audit-summary.txt
+```
+
+### Incident Investigation
+```bash
+# 1. Check overall stats
+faramesh audit stats dpr.db
+
+# 2. Export denials
+faramesh audit export dpr.db --effect DENY --format json > denials.json
+
+# 3. Analyze with jq
+cat denials.json | jq '.[] | select(.agent_id == "payment-bot")'
+```
+
+### Production Monitoring
+```bash
+# Tail all agents to centralized logging
+faramesh audit tail | tee -a /var/log/faramesh/audit.log
+
+# Or use structured output
+faramesh audit tail --json | jq -c . >> /var/log/faramesh/audit.jsonl
+```
+
+## DPR Chain Integrity
+
+The DPR audit trail uses a SHA256 hash chain for tamper-evidence:
+
+```
+Record 1: hash(record_1_data)
+Record 2: hash(record_2_data + record_1_hash)
+Record 3: hash(record_3_data + record_2_hash)
+```
+
+Any modification to a record breaks the chain, detected by `faramesh audit verify`.
+
+## Storage Location
+
+Default DPR database location:
+```
+$TMPDIR/faramesh/dpr.db
+```
+
+Custom location:
+```bash
+faramesh serve --policy policy.yaml --data-dir /var/lib/faramesh
+# Creates: /var/lib/faramesh/dpr.db
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Policy Commands" icon="shield" href="/cli/policy">
+    Validate and manage policies
+  </Card>
+  
+  <Card title="Fleet Management" icon="users" href="/cli/agent">
+    Approve/deny actions and manage agents
+  </Card>
+  
+  <Card title="DPR Architecture" icon="link" href="/concepts/dpr-chain">
+    Learn about the Decision Provenance Record
+  </Card>
+  
+  <Card title="Compliance" icon="file-certificate" href="/security/compliance-exports">
+    SOC2, HIPAA, and PCI-DSS compliance
+  </Card>
+</CardGroup>

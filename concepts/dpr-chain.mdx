@@ -1,0 +1,342 @@
+---
+title: DPR Chain
+description: Decision-Provenance Record chain — tamper-evident audit trail with SHA256 linking
+---
+
+## What is a DPR?
+
+A **Decision-Provenance Record (DPR)** is a cryptographically linked audit record created for every governance decision. Each record contains:
+
+- The decision outcome (PERMIT/DENY/DEFER)
+- The matched rule ID and reason code
+- SHA256 hash of the previous record (blockchain-style linking)
+- Structural signature of arguments (never raw values)
+- Policy version that was active at decision time
+
+DPRs form a **tamper-evident chain** per agent. If any record is modified, the SHA256 chain breaks and verification fails.
+
+## Record Structure
+
+Defined in `internal/core/dpr/record.go`:
+
+```go dpr/record.go
+const SchemaVersion = "dpr/1.0"
+
+type Record struct {
+    // ── Schema & Chain Integrity ──
+    SchemaVersion  string `json:"schema_version"`
+    FPLVersion     string `json:"fpl_version,omitempty"`
+    CARVersion     string `json:"car_version,omitempty"`
+    RecordID       string `json:"record_id"`
+    PrevRecordHash string `json:"prev_record_hash"`
+    RecordHash     string `json:"record_hash"`
+    HMACSig        string `json:"hmac_signature,omitempty"`
+
+    // ── Identity & Request ──
+    AgentID          string `json:"agent_id"`
+    SessionID        string `json:"session_id"`
+    ToolID           string `json:"tool_id"`
+    InterceptAdapter string `json:"intercept_adapter"`
+    PrincipalIDHash  string `json:"principal_id_hash,omitempty"`
+
+    // ── Decision ──
+    Effect        string `json:"effect"`
+    MatchedRuleID string `json:"matched_rule_id"`
+    ReasonCode    string `json:"reason_code"`
+    Reason        string `json:"reason"`
+    DenialToken   string `json:"denial_token,omitempty"`
+
+    // ── Policy Context ──
+    PolicyVersion     string `json:"policy_version"`
+    ArgsStructuralSig string `json:"args_structural_sig"`
+
+    CreatedAt time.Time `json:"created_at"`
+}
+```
+
+<Info>
+**Privacy by Design**: The DPR stores `ArgsStructuralSig` (shape hash), never raw argument values. GDPR-compliant by default.
+</Info>
+
+## SHA256 Chain Linking
+
+Each record includes the SHA256 hash of the previous record:
+
+```go dpr/record.go
+func (r *Record) CanonicalBytes() []byte {
+    // Deterministic JSON representation excluding record_hash and hmac_signature
+    b, _ := json.Marshal(canon{
+        SchemaVersion:      r.SchemaVersion,
+        RecordID:           r.RecordID,
+        PrevRecordHash:     r.PrevRecordHash,  // ← Links to previous record
+        AgentID:            r.AgentID,
+        ToolID:             r.ToolID,
+        Effect:             r.Effect,
+        PolicyVersion:      r.PolicyVersion,
+        ArgsStructuralSig:  r.ArgsStructuralSig,
+        CreatedAt:          r.CreatedAt,
+        // ... other fields
+    })
+    return b
+}
+
+func (r *Record) ComputeHash() {
+    r.RecordHash = fmt.Sprintf("%x", sha256.Sum256(r.CanonicalBytes()))
+}
+```
+
+The chain forms a linked list:
+
+```
+Genesis Record                 Record 2                   Record 3
+┌────────────────┐            ┌────────────────┐         ┌────────────────┐
+│ record_id: abc │            │ record_id: def │         │ record_id: ghi │
+│ prev: genesis  │───────────▶│ prev: abc_hash │────────▶│ prev: def_hash │
+│ hash: abc_hash │            │ hash: def_hash │         │ hash: ghi_hash │
+└────────────────┘            └────────────────┘         └────────────────┘
+```
+
+## The WAL-First Invariant
+
+**Critical architecture rule**: The WAL (write-ahead log) record is written and fsynced **before** the decision is returned to the caller.
+
+From `internal/core/pipeline.go`:
+
+```go pipeline.go:356
+func (p *Pipeline) decide(req CanonicalActionRequest, d Decision, sess *session.State, start time.Time) Decision {
+    // ... build record ...
+
+    // [9] WAL write — fsync before returning.
+    rec := p.buildRecord(req, d)
+    d.DPRRecordID = rec.RecordID
+    if err := p.wal.Write(rec); err != nil {
+        // If we can't write the audit record, we must deny.
+        // Execution must never precede the audit record.
+        return Decision{
+            Effect:     EffectDeny,
+            ReasonCode: reasons.WALWriteFailure,
+            Reason:     "audit record write failed; denying to preserve WAL invariant",
+            Latency:    time.Since(start),
+        }
+    }
+
+    // [10] Async: replicate to SQLite
+    if p.store != nil {
+        go func() {
+            _ = p.store.Save(rec)
+        }()
+    }
+
+    // [11] Return Decision.
+    return d
+}
+```
+
+<Warning>
+**No execution without an audit record** — under any failure mode. If the WAL write fails, the pipeline returns DENY immediately.
+</Warning>
+
+## Structural Signature (Privacy)
+
+The `ArgsStructuralSig` captures only the **shape** of arguments, never values:
+
+```go dpr/record.go
+func ArgsSignature(args map[string]any) string {
+    if len(args) == 0 {
+        return "{}"
+    }
+    sig := structuralSig(args, 0)
+    return fmt.Sprintf("%x", sha256.Sum256([]byte(sig)))[:16]
+}
+
+func structuralSig(v any, depth int) string {
+    switch val := v.(type) {
+    case map[string]any:
+        parts := make([]string, 0, len(val))
+        for k, child := range val {
+            parts = append(parts, k+":"+structuralSig(child, depth+1))
+        }
+        return "{" + join(parts) + "}"
+    case string:
+        return "string"
+    case float64, int, int64:
+        return "number"
+    case bool:
+        return "bool"
+    default:
+        return "unknown"
+    }
+}
+```
+
+Example:
+
+```json
+// Input:
+{"amount": 500, "currency": "usd", "metadata": {"user": "alice"}}
+
+// Structural signature:
+{amount:number,currency:string,metadata:{user:string}}
+
+// SHA256 hash (first 16 chars):
+args_structural_sig: "7a4f2b9c1e8d3a5f"
+```
+
+<Check>
+**GDPR Compliance**: No PII is stored in the DPR. Auditors can verify governance behavior without seeing sensitive data.
+</Check>
+
+## Storage Backends
+
+DPRs are written to two destinations:
+
+1. **WAL (Write-Ahead Log)** — Append-only file, fsynced before decision return
+2. **Store Backend** — Async replication for queryability (SQLite, Postgres)
+
+### SQLite Backend (Default)
+
+```go dpr/sqlite.go
+type SQLiteStore struct {
+    db *sql.DB
+}
+
+func (s *SQLiteStore) Save(rec *Record) error {
+    _, err := s.db.Exec(`
+        INSERT INTO dpr_records (
+            record_id, prev_record_hash, record_hash,
+            agent_id, session_id, tool_id, effect,
+            matched_rule_id, reason_code, policy_version,
+            args_structural_sig, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, rec.RecordID, rec.PrevRecordHash, rec.RecordHash, ...)
+    return err
+}
+```
+
+Default location: `~/.faramesh/faramesh.db`
+
+### PostgreSQL Backend
+
+For production fleets:
+
+```yaml config.yaml
+storage:
+  backend: postgres
+  postgres:
+    host: postgres.example.com
+    database: faramesh
+    table: dpr_records
+```
+
+## Verifying Chain Integrity
+
+```bash
+faramesh audit verify ~/.faramesh/faramesh.db
+```
+
+Verification algorithm:
+
+```go
+func VerifyChain(store StoreBackend, agentID string) error {
+    records, err := store.List(agentID)
+    if err != nil {
+        return err
+    }
+
+    var prevHash string
+    for i, rec := range records {
+        // Recompute hash from canonical bytes
+        expected := fmt.Sprintf("%x", sha256.Sum256(rec.CanonicalBytes()))
+        if rec.RecordHash != expected {
+            return fmt.Errorf("record %d: hash mismatch", i)
+        }
+
+        // Verify chain linkage
+        if i > 0 && rec.PrevRecordHash != prevHash {
+            return fmt.Errorf("record %d: prev_record_hash mismatch", i)
+        }
+
+        prevHash = rec.RecordHash
+    }
+
+    return nil
+}
+```
+
+Output:
+
+```
+✓ Chain integrity verified. 1,247 records, 0 violations.
+```
+
+## Query the DPR Chain
+
+```bash
+# Tail live decisions
+faramesh audit tail
+
+# Query by agent
+faramesh audit query --agent payment-bot --effect DENY
+
+# Export to JSON
+faramesh audit export --agent payment-bot --output audit.json
+
+# Show a specific decision
+faramesh audit show <dpr-record-id>
+```
+
+## Multi-Agent Linkage
+
+When agents invoke other agents, the DPR records the delegation:
+
+```go dpr/record.go
+type Record struct {
+    // ...
+    InvokedByAgentID    string `json:"invoked_by_agent_id,omitempty"`
+    InvokedByDPRID      string `json:"invoked_by_dpr_record_id,omitempty"`
+    InnerGovernanceDPRID string `json:"inner_governance_dpr_record_id,omitempty"`
+}
+```
+
+This creates a **cross-agent audit trail**:
+
+```
+Orchestrator (payment-bot)
+  └─ DPR abc123
+       └─ invokes Sub-Agent (refund-processor)
+            └─ DPR def456 (invoked_by_dpr_id: abc123)
+```
+
+## Compliance Exports
+
+```bash
+# Export for SOC 2 audit
+faramesh audit export --format soc2 --start 2024-01-01 --end 2024-12-31
+
+# Export for HIPAA
+faramesh audit export --format hipaa --anonymize
+
+# Export for EU AI Act
+faramesh audit export --format eu-ai-act --include-policy-versions
+```
+
+<Info>
+**Faramesh Cloud**: Compliance exports with automated attestation are available on Team and Enterprise plans.
+</Info>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="DEFER Workflow" icon="hand" href="/concepts/defer-workflow">
+    Human-in-the-loop approval workflow
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand the unified core
+  </Card>
+  <Card title="Audit Guide" icon="magnifying-glass" href="/security/audit-trail">
+    Query and analyze DPR records
+  </Card>
+  <Card title="Compliance" icon="shield-check" href="/security/compliance-exports">
+    SOC 2, HIPAA, EU AI Act exports
+  </Card>
+</CardGroup>

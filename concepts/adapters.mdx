@@ -1,0 +1,449 @@
+---
+title: Deployment Adapters
+description: Six adapters for every environment — SDK, daemon, sidecar, serverless, MCP, eBPF
+---
+
+## The Adapter Model
+
+Faramesh uses a **unified core + thin adapters** architecture. The adapter's only job is to:
+
+1. Normalize tool calls into a `CanonicalActionRequest` (CAR)
+2. Send the CAR to the core pipeline
+3. Act on the `Decision` (PERMIT/DENY/DEFER)
+
+Adapters do **not** evaluate policy, manage sessions, or write audit records. The core does all of that.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Invariant Core                              │
+│  Policy Engine │ DPR Chain │ Session State │ DEFER Workflow     │
+└────────────────┬────────────────────────────────────────────────┘
+                 │ CanonicalActionRequest
+                 │
+     ┌───────────┼───────────┬──────────┬──────────┬──────────┐
+     │           │           │          │          │          │
+   ┌─▼──┐     ┌─▼──┐     ┌─▼──┐    ┌─▼──┐    ┌─▼──┐    ┌─▼──┐
+   │ A1 │     │ A2 │     │ A3 │    │ A4 │    │ A5 │    │ A6 │
+   └────┘     └────┘     └────┘    └────┘    └────┘    └────┘
+   SDK        Daemon    Sidecar  Serverless   MCP      eBPF
+```
+
+## A1: SDK Shim
+
+**Use case**: Jupyter notebooks, scripts, local development
+
+**How it works**: The SDK wraps your functions with a `govern()` decorator. On first call, it auto-starts the daemon in the background and connects over Unix socket.
+
+### Python
+
+```python
+from faramesh import govern
+import stripe
+
+def stripe_refund(amount: float, currency: str) -> dict:
+    return stripe.Refund.create(amount=int(amount * 100), currency=currency)
+
+# Wrap the function
+governed_refund = govern(
+    stripe_refund,
+    policy='payment.yaml',
+    agent_id='payment-bot'
+)
+
+# Call it — governance happens transparently
+try:
+    result = governed_refund(amount=100, currency='usd')
+except DenyError as e:
+    print(f"DENY: {e.reason}")
+except DeferredError as e:
+    print(f"DEFER: approve with: faramesh agent approve {e.defer_token}")
+```
+
+### TypeScript
+
+```typescript
+import { govern } from '@faramesh/sdk';
+
+const refund = async (amount: number, currency: string) => {
+  return await stripe.refunds.create({ amount: amount * 100, currency });
+};
+
+const governedRefund = govern(refund, {
+  policy: 'payment.yaml',
+  agentId: 'payment-bot',
+});
+
+try {
+  const result = await governedRefund(100, 'usd');
+} catch (e) {
+  if (e instanceof DenyError) {
+    console.error('DENY:', e.reason);
+  }
+}
+```
+
+### LangChain Integration
+
+```python
+from langchain.tools import tool
+from faramesh import govern
+
+@tool
+def stripe_refund(amount: float, currency: str) -> str:
+    """Refund a charge via Stripe."""
+    # ...
+
+# LangChain metadata (name, description, args_schema) is fully preserved
+governed_refund = govern(stripe_refund, policy='payment.yaml', agent_id='payment-bot')
+```
+
+**Location**: `internal/adapter/sdk/`
+
+<Check>
+**Zero config**: `govern()` auto-starts the daemon. No separate setup in development.
+</Check>
+
+---
+
+## A2: Local Daemon
+
+**Use case**: Long-running agents, production scripts, CI/CD pipelines
+
+**How it works**: Start the daemon once. It loads the policy, opens the WAL and DPR store, and listens on `/tmp/faramesh.sock`. SDKs connect to it.
+
+```bash
+faramesh serve --policy payment.yaml
+```
+
+Output:
+
+```
+Faramesh v1.0.0
+Policy: payment.yaml (version: sha256:7a4f2b9c...)
+WAL: /tmp/faramesh.wal
+DPR: ~/.faramesh/faramesh.db
+Listening on: /tmp/faramesh.sock
+```
+
+The daemon is a gRPC server over Unix domain socket:
+
+```go internal/adapter/daemon/server.go
+type Server struct {
+    pipeline *core.Pipeline
+    listener net.Listener
+}
+
+func (s *Server) Evaluate(ctx context.Context, req *pb.EvalRequest) (*pb.EvalResponse, error) {
+    car := core.CanonicalActionRequest{
+        CallID:           req.CallId,
+        AgentID:          req.AgentId,
+        SessionID:        req.SessionId,
+        ToolID:           req.ToolId,
+        Args:             req.Args.AsMap(),
+        InterceptAdapter: "daemon",
+    }
+    decision := s.pipeline.Evaluate(car)
+    return &pb.EvalResponse{
+        Effect:     string(decision.Effect),
+        Reason:     decision.Reason,
+        DeferToken: decision.DeferToken,
+    }, nil
+}
+```
+
+**Location**: `internal/adapter/daemon/`
+
+---
+
+## A3: Sidecar + Transparent Proxy
+
+**Use case**: Kubernetes production, network-isolated environments
+
+**How it works**: Deploy Faramesh as a sidecar container. Use `NetworkPolicy` to route all HTTP/gRPC traffic through the sidecar. The proxy inspects requests, sends CARs to the core, and enforces decisions.
+
+### Kubernetes Deployment
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: payment-agent
+spec:
+  containers:
+  - name: agent
+    image: company/payment-agent:v1
+    env:
+    - name: FARAMESH_PROXY
+      value: "http://localhost:9090"
+
+  - name: faramesh-sidecar
+    image: ghcr.io/faramesh/faramesh:latest
+    args: ["serve", "--policy", "/config/policy.yaml", "--proxy-mode"]
+    ports:
+    - containerPort: 9090
+    volumeMounts:
+    - name: policy
+      mountPath: /config
+
+  volumes:
+  - name: policy
+    configMap:
+      name: faramesh-policy
+```
+
+### NetworkPolicy
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: faramesh-enforce
+spec:
+  podSelector:
+    matchLabels:
+      app: payment-agent
+  policyTypes:
+  - Egress
+  egress:
+  # All HTTP traffic must go through sidecar
+  - to:
+    - podSelector:
+        matchLabels:
+          app: faramesh-sidecar
+    ports:
+    - protocol: TCP
+      port: 9090
+```
+
+The sidecar inspects HTTP requests:
+
+```go internal/adapter/proxy/server.go
+func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    car := core.CanonicalActionRequest{
+        ToolID:    fmt.Sprintf("http/%s", strings.ToLower(r.Method)),
+        Args:      map[string]any{"url": r.URL.String(), "method": r.Method},
+        AgentID:   r.Header.Get("X-Faramesh-Agent-ID"),
+        SessionID: r.Header.Get("X-Faramesh-Session-ID"),
+    }
+    decision := p.pipeline.Evaluate(car)
+    if decision.Effect == core.EffectDeny {
+        http.Error(w, decision.Reason, http.StatusForbidden)
+        return
+    }
+    p.proxyUpstream(w, r)
+}
+```
+
+**Location**: `internal/adapter/proxy/`
+
+---
+
+## A4: Serverless (Lambda/Cloud Run)
+
+**Use case**: AWS Lambda, Google Cloud Run, Azure Functions
+
+**How it works**: Package Faramesh as a Lambda layer or sidecar. Policy is loaded from environment variable or S3.
+
+### AWS Lambda Layer
+
+```bash
+# Build layer
+faramesh build lambda-layer --output faramesh-layer.zip
+
+# Deploy
+aws lambda publish-layer-version \
+  --layer-name faramesh \
+  --zip-file fileb://faramesh-layer.zip
+```
+
+### Lambda Function
+
+```python
+import json
+from faramesh import govern_lambda
+
+@govern_lambda(policy_s3_key='s3://my-bucket/policy.yaml')
+def handler(event, context):
+    # Your agent logic
+    amount = event['amount']
+    return stripe_refund(amount)
+```
+
+The `govern_lambda` decorator wraps the handler:
+
+```python
+def govern_lambda(policy_s3_key):
+    def decorator(func):
+        def wrapper(event, context):
+            car = build_car_from_event(event, context)
+            decision = evaluate(car)
+            if decision.effect == 'DENY':
+                return {'statusCode': 403, 'body': decision.reason}
+            return func(event, context)
+        return wrapper
+    return decorator
+```
+
+**Location**: `internal/adapter/serverless/`
+
+---
+
+## A5: MCP Gateway
+
+**Use case**: Model Context Protocol (MCP) servers
+
+**How it works**: Faramesh **is** an MCP server. Add it to your MCP client config, and all tool calls flow through governance.
+
+### MCP Client Config
+
+```json claude_desktop_config.json
+{
+  "mcpServers": {
+    "faramesh": {
+      "command": "faramesh",
+      "args": ["mcp", "--policy", "payment.yaml"]
+    }
+  }
+}
+```
+
+The MCP gateway implements the MCP protocol:
+
+```go internal/adapter/mcp/gateway.go
+func (g *Gateway) HandleToolCall(req *mcp.ToolCallRequest) (*mcp.ToolCallResponse, error) {
+    car := core.CanonicalActionRequest{
+        ToolID:    req.Name,
+        Args:      req.Arguments,
+        AgentID:   "mcp-client",
+        SessionID: req.SessionID,
+    }
+    decision := g.pipeline.Evaluate(car)
+    if decision.Effect == core.EffectDeny {
+        return &mcp.ToolCallResponse{
+            IsError: true,
+            Content: []mcp.Content{{Type: "text", Text: decision.Reason}},
+        }, nil
+    }
+    return g.upstreamMCP.Call(req)
+}
+```
+
+**Location**: `internal/adapter/mcp/`
+
+<Info>
+See the [MCP Integration Guide](/guides/mcp-gateway) for full setup instructions.
+</Info>
+
+---
+
+## A6: eBPF (Linux Kernel Probes)
+
+**Use case**: Kernel-level governance, syscall interception
+
+**How it works** (Linux only): Attach eBPF probes to syscalls. Intercept `execve`, `connect`, `open` and send CARs to the core.
+
+```bash
+# Requires CAP_BPF or root
+sudo faramesh serve --policy policy.yaml --ebpf
+```
+
+eBPF probe:
+
+```go internal/adapter/ebpf/probe.go
+func (p *Probe) AttachExecve() error {
+    kprobe, err := link.Kprobe("sys_execve", p.prog)
+    if err != nil {
+        return err
+    }
+    go p.readEvents()
+    return nil
+}
+
+func (p *Probe) readEvents() {
+    for {
+        event := <-p.eventChan
+        car := core.CanonicalActionRequest{
+            ToolID: "shell/exec",
+            Args:   map[string]any{"cmd": event.Cmd, "args": event.Args},
+        }
+        decision := p.pipeline.Evaluate(car)
+        if decision.Effect == core.EffectDeny {
+            p.killProcess(event.PID)
+        }
+    }
+}
+```
+
+<Warning>
+**eBPF is experimental**: Use only in controlled environments. Kernel-level interception has performance implications.
+</Warning>
+
+**Location**: `internal/adapter/ebpf/`
+
+---
+
+## Auto-Detection
+
+`faramesh init --auto-detect` inspects your environment and selects the right adapter:
+
+```bash
+faramesh init --auto-detect
+```
+
+Logic:
+
+```go internal/core/bootstrap.go
+func DetectEnvironment() string {
+    if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+        return "kubernetes"  // → A3 sidecar
+    }
+    if os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != "" {
+        return "lambda"  // → A4 serverless
+    }
+    if os.Getenv("MCP_SERVER") != "" {
+        return "mcp"  // → A5 gateway
+    }
+    return "daemon"  // → A2 local daemon
+}
+```
+
+Output:
+
+```
+✓ Detected environment: kubernetes
+✓ Generated Helm chart: faramesh-chart/
+✓ Generated NetworkPolicy: faramesh-chart/templates/networkpolicy.yaml
+
+Next steps:
+  helm install faramesh ./faramesh-chart
+```
+
+---
+
+## Adapter Comparison
+
+| Adapter | Environment | Latency | Setup Time | Production Ready |
+|---------|------------|---------|------------|------------------|
+| **A1: SDK** | Jupyter, scripts | ~1ms | &lt;60 sec | ✓ |
+| **A2: Daemon** | Long-running agents | ~0.5ms | ~2 min | ✓ |
+| **A3: Sidecar** | Kubernetes | ~2ms | ~10 min | ✓ |
+| **A4: Serverless** | Lambda, Cloud Run | ~5ms | ~15 min | ✓ |
+| **A5: MCP** | MCP servers | ~1ms | ~5 min | ✓ |
+| **A6: eBPF** | Linux kernel | ~10μs | ~30 min | Experimental |
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand the unified core
+  </Card>
+  <Card title="Kubernetes Guide" icon="dharmachakra" href="/guides/kubernetes">
+    Deploy the sidecar adapter
+  </Card>
+  <Card title="Serverless Guide" icon="lambda" href="/guides/serverless">
+    Package for AWS Lambda
+  </Card>
+  <Card title="MCP Integration" icon="plug" href="/guides/mcp-gateway">
+    Use Faramesh as an MCP server
+  </Card>
+</CardGroup>

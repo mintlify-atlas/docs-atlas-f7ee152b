@@ -1,0 +1,594 @@
+---
+title: Tool Metadata Schema
+description: Reversibility, blast radius, tags, and cost tracking for risk-aware governance
+---
+
+## Overview
+
+Tool metadata enables **risk-aware policy decisions** by declaring each tool's operational characteristics. Policy rules can inspect tool metadata to make context-sensitive governance choices.
+
+Metadata is declared in the policy's `tools:` section and accessible in rule conditions via `tool.*` variables.
+
+---
+
+## Tool Declaration
+
+```yaml
+tools:
+  stripe/refund:
+    reversibility: irreversible
+    blast_radius: external
+    shadow_safe: false
+    tags: [financial, customer-facing]
+    endpoint_pattern: "https://api.stripe.com/*"
+    cost_usd: 0.25
+```
+
+---
+
+## Reversibility
+
+**Whether the tool's effects can be undone.**
+
+Reversibility informs governance decisions about recovery options if an action needs to be reversed.
+
+<ParamField path="reversibility" type="string">
+  Reversibility classification.
+  
+  Valid values:
+  - `reversible` — Effects can be easily undone (e.g., reads, queries)
+  - `irreversible` — Effects are permanent (e.g., deletes, payments)
+  - `compensatable` — Effects can be reversed via compensation tool (e.g., refundable charges)
+  
+  ```yaml
+  reversibility: irreversible
+  ```
+</ParamField>
+
+### Examples
+
+<CodeGroup>
+```yaml Reversible
+tools:
+  http/get:
+    reversibility: reversible
+  
+  read_file:
+    reversibility: reversible
+  
+  database/query:
+    reversibility: reversible
+```
+
+```yaml Irreversible
+tools:
+  delete_file:
+    reversibility: irreversible
+  
+  shell/exec:
+    reversibility: irreversible
+  
+  send_email:
+    reversibility: irreversible
+```
+
+```yaml Compensatable
+tools:
+  stripe/charge:
+    reversibility: compensatable
+  
+  create_subscription:
+    reversibility: compensatable
+```
+</CodeGroup>
+
+### Using in Policy Rules
+
+```yaml
+rules:
+  # Defer all irreversible actions
+  - id: defer-irreversible
+    match:
+      tool: "*"
+      when: "tool.reversibility == 'irreversible'"
+    effect: defer
+    reason: "Irreversible actions require approval"
+  
+  # Auto-approve reversible reads
+  - id: permit-reversible
+    match:
+      tool: "*"
+      when: "tool.reversibility == 'reversible'"
+    effect: permit
+    reason: "Safe reversible operations"
+```
+
+---
+
+## Blast Radius
+
+**Scope of impact if the tool is misused or errors.**
+
+Blast radius quantifies the worst-case damage from a tool call, enabling risk-proportional governance.
+
+<ParamField path="blast_radius" type="string">
+  Impact scope classification.
+  
+  Valid values:
+  - `none` — No lasting impact (e.g., reads)
+  - `local` — Affects single resource (e.g., update one record)
+  - `scoped` — Affects related resources (e.g., update all records for a customer)
+  - `system` — System-wide impact (e.g., database schema change)
+  - `external` — Impacts external systems or users (e.g., send payment, email blast)
+  
+  Legacy aliases: `low`, `medium`, `high` (mapped to `local`, `scoped`, `external`)
+  
+  ```yaml
+  blast_radius: external
+  ```
+</ParamField>
+
+### Examples
+
+<CodeGroup>
+```yaml None/Local
+tools:
+  http/get:
+    blast_radius: none
+  
+  read_file:
+    blast_radius: none
+  
+  update_record:
+    blast_radius: local
+```
+
+```yaml Scoped/System
+tools:
+  bulk_update:
+    blast_radius: scoped
+  
+  shell/exec:
+    blast_radius: system
+  
+  database/migrate:
+    blast_radius: system
+```
+
+```yaml External
+tools:
+  stripe/refund:
+    blast_radius: external
+  
+  send_email:
+    blast_radius: external
+  
+  http/post:
+    blast_radius: external
+```
+</CodeGroup>
+
+### Using in Policy Rules
+
+```yaml
+rules:
+  # Require approval for external impact
+  - id: defer-external-blast
+    match:
+      tool: "*"
+      when: "tool.blast_radius == 'external'"
+    effect: defer
+    reason: "External-impact tools require approval"
+    incident_severity: high
+  
+  # Deny system-wide changes outside maintenance windows
+  - id: deny-system-changes
+    match:
+      tool: "*"
+      when: "tool.blast_radius == 'system' && (time.hour < 2 || time.hour > 4)"
+    effect: deny
+    reason: "System-wide changes only allowed during maintenance window (2-4 AM UTC)"
+```
+
+---
+
+## Shadow Safety
+
+**Whether the tool is safe to execute in SHADOW mode.**
+
+Shadow-safe tools have no side effects and can execute during policy testing and dry runs.
+
+<ParamField path="shadow_safe" type="boolean" default="false">
+  Whether tool can execute in SHADOW mode.
+  
+  - `true` — Safe to execute (read-only, no side effects)
+  - `false` — Will be mocked in SHADOW mode
+  
+  ```yaml
+  shadow_safe: true
+  ```
+</ParamField>
+
+### Examples
+
+```yaml
+tools:
+  http/get:
+    shadow_safe: true  # ✅ Safe: read-only
+  
+  database/query:
+    shadow_safe: true  # ✅ Safe: read-only
+  
+  stripe/refund:
+    shadow_safe: false  # ❌ Unsafe: has side effects
+  
+  send_email:
+    shadow_safe: false  # ❌ Unsafe: sends real emails
+```
+
+### SHADOW Mode Behavior
+
+When a rule has `effect: shadow`:
+
+1. **If `shadow_safe: true`**: Tool executes normally
+2. **If `shadow_safe: false`**: Tool returns synthetic mock data
+
+```yaml
+rules:
+  # Test new policy without side effects
+  - id: shadow-test
+    match:
+      tool: "*"
+      when: "vars.testing_mode == true"
+    effect: shadow
+    reason: "Testing new policy"
+```
+
+---
+
+## Tags
+
+**Arbitrary string labels for classification and filtering.**
+
+Tags enable flexible tool categorization beyond reversibility/blast_radius.
+
+<ParamField path="tags" type="array">
+  List of string tags.
+  
+  ```yaml
+  tags: [financial, user-facing, gdpr, pii]
+  ```
+</ParamField>
+
+### Example Tags
+
+```yaml
+tools:
+  stripe/refund:
+    tags: [financial, customer-facing, reversible-with-approval]
+  
+  send_email:
+    tags: [communications, user-facing, gdpr]
+  
+  database/export:
+    tags: [data-access, pii, gdpr, audit-required]
+  
+  shell/exec:
+    tags: [dangerous, system-level]
+```
+
+### Using in Policy Rules
+
+```yaml
+rules:
+  # GDPR compliance: defer all PII access
+  - id: defer-pii-access
+    match:
+      tool: "*"
+      when: "contains(tool.tags, 'pii')"
+    effect: defer
+    reason: "PII access requires approval (GDPR compliance)"
+    incident_category: data_privacy
+  
+  # Financial controls: require approval for all financial tools
+  - id: defer-financial
+    match:
+      tool: "*"
+      when: "contains(tool.tags, 'financial')"
+    effect: defer
+    reason: "Financial operations require approval"
+    incident_severity: high
+  
+  # Deny dangerous tools to junior agents
+  - id: deny-dangerous-for-juniors
+    match:
+      tool: "*"
+      when: "contains(tool.tags, 'dangerous') && principal.tier == 'basic'"
+    effect: deny
+    reason: "Dangerous tools restricted to senior agents"
+```
+
+---
+
+## Endpoint Pattern
+
+**Pattern for validating tool endpoints/targets.**
+
+Useful for HTTP tools, database connections, and other tools with variable targets.
+
+<ParamField path="endpoint_pattern" type="string">
+  Glob or regex pattern for endpoint validation.
+  
+  ```yaml
+  endpoint_pattern: "https://*.company.com/*"
+  ```
+</ParamField>
+
+### Examples
+
+```yaml
+tools:
+  http/get:
+    endpoint_pattern: "https://api.company.com/*"
+  
+  http/post:
+    endpoint_pattern: "https://*.company.com/*"
+  
+  database/connect:
+    endpoint_pattern: "postgresql://prod-*.internal:5432/*"
+```
+
+---
+
+## Cost Tracking
+
+**Estimated cost in USD per successful tool call.**
+
+Enables budget enforcement and cost-aware governance.
+
+<ParamField path="cost_usd" type="number">
+  Cost per successful call in USD.
+  
+  For tools with variable costs, set this to the base/minimum cost. The runtime can call `sess.AddCost()` with actual costs after execution.
+  
+  ```yaml
+  cost_usd: 0.15
+  ```
+</ParamField>
+
+### Examples
+
+```yaml
+tools:
+  http/get:
+    cost_usd: 0.01  # Cheap read
+  
+  stripe/refund:
+    cost_usd: 0.25  # Higher cost: payment API
+  
+  llm/generate:
+    cost_usd: 0.50  # Variable: base cost, actual tracked dynamically
+  
+  database/export:
+    cost_usd: 1.00  # Expensive operation
+```
+
+### Budget Enforcement
+
+Costs accumulate against session and daily budgets:
+
+```yaml
+budget:
+  session_usd: 10.00
+  daily_usd: 100.00
+  on_exceed: defer
+```
+
+When a tool call would exceed the budget:
+1. Call is blocked (or deferred, based on `on_exceed`)
+2. Error returned with reason code `BUDGET_EXCEEDED`
+
+### Using in Policy Rules
+
+```yaml
+rules:
+  # Defer expensive operations near budget limit
+  - id: defer-near-budget
+    match:
+      tool: "*"
+      when: "session.cost_usd + tool.cost_usd > 8.00"
+    effect: defer
+    reason: "Approaching session budget limit"
+  
+  # Alert on high daily spend
+  - id: defer-high-daily-spend
+    match:
+      tool: "*"
+      when: "session.daily_cost_usd > 75.00"
+    effect: defer
+    reason: "Daily spend approaching limit"
+```
+
+---
+
+## Complete Example
+
+```yaml
+faramesh-version: "1.0"
+agent-id: "production-bot"
+
+tools:
+  # Safe read-only tools
+  http/get:
+    reversibility: reversible
+    blast_radius: none
+    shadow_safe: true
+    tags: [read-only, external-api]
+    endpoint_pattern: "https://*.company.com/*"
+    cost_usd: 0.01
+  
+  database/query:
+    reversibility: reversible
+    blast_radius: none
+    shadow_safe: true
+    tags: [read-only, database]
+    cost_usd: 0.02
+  
+  # High-risk financial tools
+  stripe/refund:
+    reversibility: irreversible
+    blast_radius: external
+    shadow_safe: false
+    tags: [financial, customer-facing, audit-required]
+    endpoint_pattern: "https://api.stripe.com/*"
+    cost_usd: 0.25
+  
+  stripe/charge:
+    reversibility: compensatable
+    blast_radius: external
+    shadow_safe: false
+    tags: [financial, customer-facing, audit-required]
+    cost_usd: 0.25
+  
+  # System-level tools
+  shell/exec:
+    reversibility: irreversible
+    blast_radius: system
+    shadow_safe: false
+    tags: [dangerous, system-level]
+    cost_usd: 0.05
+  
+  database/migrate:
+    reversibility: irreversible
+    blast_radius: system
+    shadow_safe: false
+    tags: [dangerous, database, schema-change]
+    cost_usd: 0.50
+  
+  # PII/GDPR tools
+  customer/export_data:
+    reversibility: reversible
+    blast_radius: local
+    shadow_safe: false
+    tags: [pii, gdpr, audit-required]
+    cost_usd: 0.10
+
+budget:
+  session_usd: 10.00
+  daily_usd: 100.00
+  on_exceed: defer
+
+rules:
+  # Auto-approve safe reads
+  - id: permit-safe-reads
+    match:
+      tool: "*"
+      when: "tool.reversibility == 'reversible' && tool.blast_radius == 'none'"
+    effect: permit
+    reason: "Safe read-only operations"
+  
+  # Defer all irreversible external actions
+  - id: defer-irreversible-external
+    match:
+      tool: "*"
+      when: "tool.reversibility == 'irreversible' && tool.blast_radius == 'external'"
+    effect: defer
+    reason: "Irreversible external actions require approval"
+    incident_severity: high
+  
+  # GDPR compliance
+  - id: defer-pii-access
+    match:
+      tool: "*"
+      when: "contains(tool.tags, 'pii')"
+    effect: defer
+    reason: "PII access requires approval (GDPR)"
+    incident_category: data_privacy
+  
+  # Financial controls
+  - id: defer-financial
+    match:
+      tool: "*"
+      when: "contains(tool.tags, 'financial')"
+    effect: defer
+    reason: "Financial operations require approval"
+  
+  # Deny dangerous tools outside maintenance
+  - id: deny-system-changes
+    match:
+      tool: "*"
+      when: "contains(tool.tags, 'dangerous') && (time.hour < 2 || time.hour > 4)"
+    effect: deny
+    reason: "System changes only allowed 2-4 AM UTC"
+
+default_effect: deny
+```
+
+---
+
+## Compensation Mapping
+
+For `compensatable` tools, define reversal procedures:
+
+```yaml
+tools:
+  stripe/charge:
+    reversibility: compensatable
+    blast_radius: external
+
+compensation:
+  stripe/charge:
+    compensation_tool: "stripe/refund"
+    arg_mapping:
+      charge_id: "$.id"
+      amount: "$.amount"
+      reason: "Governance-triggered reversal"
+```
+
+When a compensatable action needs reversal:
+1. Runtime invokes `compensation_tool` with mapped args
+2. Original action result is passed through JSONPath expressions
+3. Compensation executes automatically or with approval
+
+---
+
+## Best Practices
+
+### Metadata Accuracy
+- Err on the side of caution (mark questionable tools as `irreversible`)
+- Review metadata quarterly as tools evolve
+- Document assumptions in comments
+
+### Tag Conventions
+- Use lowercase kebab-case: `user-facing`, not `User_Facing`
+- Establish organization-wide tag taxonomy
+- Common tags: `financial`, `pii`, `gdpr`, `audit-required`, `read-only`, `dangerous`
+
+### Cost Tracking
+- Update costs when pricing changes
+- For variable-cost tools, set conservative base cost
+- Monitor actual vs. estimated costs in production
+
+### Testing
+- Use SHADOW mode to validate metadata before production
+- Test `shadow_safe` flags with dry runs
+- Verify compensation mappings with integration tests
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Policy YAML" icon="file-code" href="/reference/policy-yaml">
+    Complete policy schema reference
+  </Card>
+  <Card title="Rule Effects" icon="gavel" href="/reference/rule-effects">
+    PERMIT, DENY, DEFER, and SHADOW effects
+  </Card>
+  <Card title="Session State" icon="database" href="/reference/session-state">
+    Session history and context API
+  </Card>
+  <Card title="External Selectors" icon="plug" href="/reference/selectors">
+    Custom operators and data sources
+  </Card>
+</CardGroup>

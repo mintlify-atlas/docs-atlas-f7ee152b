@@ -1,0 +1,544 @@
+---
+title: Kubernetes Deployment
+description: Deploy Faramesh on Kubernetes with sidecar injection, NetworkPolicy, and Helm
+---
+
+Deploy Faramesh on Kubernetes using the **A3 (Sidecar + Transparent Proxy)** adapter. The sidecar pattern runs the Faramesh daemon alongside your agent pods, with optional NetworkPolicy enforcement for network-level isolation.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│  Agent Pod                                      │
+│  ┌──────────────────┐  ┌──────────────────┐    │
+│  │  Agent Container │  │ Faramesh Sidecar │    │
+│  │                  │  │                  │    │
+│  │  Python/Node/Go  │  │  Policy Engine   │    │
+│  │                  │  │  DPR Chain       │    │
+│  │  localhost:8080 ─┼──► Unix Socket      │    │
+│  │                  │  │  /var/run/       │    │
+│  └──────────────────┘  │  faramesh.sock   │    │
+│                        └──────────────────┘    │
+│  Shared Volume: /var/run/faramesh              │
+└─────────────────────────────────────────────────┘
+```
+
+The agent container communicates with the Faramesh sidecar via a shared Unix socket mounted on a Kubernetes `emptyDir` volume.
+
+## Quick Start with Helm
+
+<Steps>
+  <Step title="Install Helm chart">
+    ```bash
+    helm repo add faramesh https://charts.faramesh.dev
+    helm repo update
+    ```
+  </Step>
+
+  <Step title="Create a policy ConfigMap">
+    ```bash
+    kubectl create configmap faramesh-policy \
+      --from-file=policy.yaml=./policy.yaml \
+      -n default
+    ```
+  </Step>
+
+  <Step title="Deploy Faramesh sidecar injector">
+    ```bash
+    helm install faramesh faramesh/faramesh-sidecar \
+      --set policy.configMap=faramesh-policy \
+      --set policy.key=policy.yaml
+    ```
+  </Step>
+
+  <Step title="Enable injection on your agent pods">
+    Add the `faramesh.io/inject: "true"` label to your Deployment:
+
+    ```yaml agent-deployment.yaml
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: payment-agent
+      labels:
+        app: payment-agent
+        faramesh.io/inject: "true"  # Enable sidecar injection
+    spec:
+      replicas: 3
+      selector:
+        matchLabels:
+          app: payment-agent
+      template:
+        metadata:
+          labels:
+            app: payment-agent
+            faramesh.io/inject: "true"
+        spec:
+          containers:
+          - name: agent
+            image: myregistry/payment-agent:latest
+            env:
+            - name: FARAMESH_SOCKET
+              value: /var/run/faramesh/faramesh.sock
+            volumeMounts:
+            - name: faramesh-socket
+              mountPath: /var/run/faramesh
+          volumes:
+          - name: faramesh-socket
+            emptyDir: {}
+    ```
+  </Step>
+
+  <Step title="Verify injection">
+    ```bash
+    kubectl get pods -l app=payment-agent
+    kubectl describe pod <pod-name>
+    # Look for the faramesh-sidecar container
+    ```
+  </Step>
+</Steps>
+
+## Manual Sidecar Deployment
+
+If you prefer not to use Helm, deploy the sidecar manually:
+
+```yaml agent-with-sidecar.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-agent
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: payment-agent
+  template:
+    metadata:
+      labels:
+        app: payment-agent
+    spec:
+      containers:
+      # Main agent container
+      - name: agent
+        image: myregistry/payment-agent:latest
+        env:
+        - name: FARAMESH_SOCKET
+          value: /var/run/faramesh/faramesh.sock
+        - name: FARAMESH_AGENT_ID
+          value: payment-agent
+        volumeMounts:
+        - name: faramesh-socket
+          mountPath: /var/run/faramesh
+
+      # Faramesh sidecar
+      - name: faramesh
+        image: ghcr.io/faramesh/faramesh:latest
+        command:
+        - /usr/local/bin/faramesh
+        - serve
+        - --policy
+        - /etc/faramesh/policy.yaml
+        - --socket
+        - /var/run/faramesh/faramesh.sock
+        - --data-dir
+        - /var/lib/faramesh
+        volumeMounts:
+        - name: faramesh-socket
+          mountPath: /var/run/faramesh
+        - name: faramesh-policy
+          mountPath: /etc/faramesh
+        - name: faramesh-data
+          mountPath: /var/lib/faramesh
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+
+      volumes:
+      - name: faramesh-socket
+        emptyDir: {}
+      - name: faramesh-policy
+        configMap:
+          name: faramesh-policy
+      - name: faramesh-data
+        emptyDir: {}
+```
+
+Apply the manifest:
+
+```bash
+kubectl apply -f agent-with-sidecar.yaml
+```
+
+## NetworkPolicy Integration
+
+Enforce network-level governance with Kubernetes NetworkPolicy:
+
+```yaml networkpolicy.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payment-agent-governance
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: payment-agent
+  policyTypes:
+  - Egress
+  egress:
+  # Allow DNS
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+
+  # Allow Stripe API (only if governed)
+  - to:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 443
+    # Faramesh sidecar controls actual execution
+
+  # Block direct internet access (force through sidecar)
+  # (No other egress rules = default deny)
+```
+
+Apply the NetworkPolicy:
+
+```bash
+kubectl apply -f networkpolicy.yaml
+```
+
+<Warning>
+  NetworkPolicy enforcement requires a CNI plugin that supports it (Calico, Cilium, Weave Net). GKE and EKS support NetworkPolicy by default.
+</Warning>
+
+## Policy ConfigMap
+
+Store your policy as a Kubernetes ConfigMap:
+
+```yaml policy-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: faramesh-policy
+  namespace: default
+data:
+  policy.yaml: |
+    faramesh-version: '1.0'
+    agent-id: payment-agent
+    default_effect: permit
+
+    vars:
+      max_refund: 1000
+      allowed_stripe_operations:
+        - charge
+        - refund
+        - customer.create
+
+    rules:
+      # Deny destructive shell commands
+      - id: deny-destructive-shell
+        match:
+          tool: shell/run
+          when: 'args["cmd"] matches "rm\\s+-[rf]"'
+        effect: deny
+        reason: destructive shell command blocked
+        reason_code: DESTRUCTIVE_SHELL_COMMAND
+
+      # Require approval for high-value refunds
+      - id: defer-high-value-refund
+        match:
+          tool: stripe_refund
+          when: 'args["amount"] > vars["max_refund"]'
+        effect: defer
+        reason: refund exceeds $1000 threshold
+        reason_code: HIGH_VALUE_REFUND
+
+      # Allow only specific Stripe operations
+      - id: allow-stripe-operations
+        match:
+          tool: stripe_*
+          when: 'any(vars["allowed_stripe_operations"], {tool matches "stripe_" + #})'
+        effect: permit
+
+      # Default deny unknown tools
+      - id: default-deny
+        match:
+          tool: "*"
+        effect: deny
+        reason: tool not in allowlist
+        reason_code: TOOL_NOT_ALLOWED
+```
+
+Apply the ConfigMap:
+
+```bash
+kubectl apply -f policy-configmap.yaml
+```
+
+Reload the policy without restarting pods:
+
+```bash
+# Update the ConfigMap
+kubectl create configmap faramesh-policy \
+  --from-file=policy.yaml=./policy.yaml \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# Restart the Faramesh sidecar to reload
+kubectl rollout restart deployment/payment-agent
+```
+
+## Persistent DPR Storage
+
+Use a `PersistentVolumeClaim` to persist the DPR audit chain:
+
+```yaml pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: faramesh-dpr
+  namespace: default
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+```
+
+Mount the PVC in the sidecar:
+
+```yaml
+containers:
+- name: faramesh
+  image: ghcr.io/faramesh/faramesh:latest
+  volumeMounts:
+  - name: faramesh-data
+    mountPath: /var/lib/faramesh
+volumes:
+- name: faramesh-data
+  persistentVolumeClaim:
+    claimName: faramesh-dpr
+```
+
+<Tip>
+  Use a shared `PersistentVolume` with `ReadWriteMany` access mode if you need multiple pods to write to the same DPR chain (requires NFS or similar).
+</Tip>
+
+## Agent Code (Python)
+
+Connect to the sidecar from your Python agent:
+
+```python
+import os
+from faramesh import govern
+
+def stripe_refund(amount: float, currency: str) -> dict:
+    """Refund a charge via Stripe."""
+    # Your Stripe API call
+    return {"status": "success", "amount": amount}
+
+# Connect to the sidecar via the shared Unix socket
+socket_path = os.getenv("FARAMESH_SOCKET", "/var/run/faramesh/faramesh.sock")
+agent_id = os.getenv("FARAMESH_AGENT_ID", "payment-agent")
+
+governed_refund = govern(
+    stripe_refund,
+    socket_path=socket_path,
+    agent_id=agent_id,
+    auto_start=False  # Sidecar is already running
+)
+
+result = governed_refund(amount=100, currency='usd')
+```
+
+## Observability
+
+### Stream Logs from Sidecar
+
+```bash
+kubectl logs -f deployment/payment-agent -c faramesh
+```
+
+### Audit Trail
+
+Exec into the sidecar to inspect the DPR chain:
+
+```bash
+kubectl exec -it deployment/payment-agent -c faramesh -- \
+  faramesh audit verify /var/lib/faramesh/faramesh.db
+
+# ✓ Chain integrity verified. 1,247 records, 0 violations.
+```
+
+### Real-Time Decisions
+
+```bash
+kubectl exec -it deployment/payment-agent -c faramesh -- \
+  faramesh audit tail
+
+# [10:00:15] PERMIT  stripe_charge      amount=$100  latency=8ms
+# [10:00:17] DENY    shell/run          cmd="rm -rf /" policy=deny-destructive-shell
+# [10:00:20] DEFER   stripe_refund      amount=$5000  token=abc123
+```
+
+## Multi-Namespace Deployment
+
+Deploy Faramesh across multiple namespaces:
+
+```bash
+# Create policy ConfigMap in each namespace
+kubectl create configmap faramesh-policy \
+  --from-file=policy.yaml=./policy.yaml \
+  -n production
+
+kubectl create configmap faramesh-policy \
+  --from-file=policy.yaml=./policy.yaml \
+  -n staging
+
+# Deploy agents with sidecars in each namespace
+kubectl apply -f agent-deployment.yaml -n production
+kubectl apply -f agent-deployment.yaml -n staging
+```
+
+## Resource Limits
+
+Set appropriate resource requests and limits for the sidecar:
+
+```yaml
+containers:
+- name: faramesh
+  image: ghcr.io/faramesh/faramesh:latest
+  resources:
+    requests:
+      memory: "128Mi"  # Minimum: 64Mi
+      cpu: "100m"      # Minimum: 50m
+    limits:
+      memory: "512Mi"  # Adjust based on DPR size and throughput
+      cpu: "1000m"     # Policy evaluation is CPU-light (<1ms per decision)
+```
+
+## Security Best Practices
+
+<AccordionGroup>
+  <Accordion title="Use least-privilege RBAC">
+    Grant the agent pod minimal permissions:
+    ```yaml
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: payment-agent
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: payment-agent
+    rules:
+    - apiGroups: [""]
+      resources: ["configmaps"]
+      verbs: ["get"]
+      resourceNames: ["faramesh-policy"]
+    ```
+  </Accordion>
+
+  <Accordion title="Enable Pod Security Standards">
+    ```yaml
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: production
+      labels:
+        pod-security.kubernetes.io/enforce: restricted
+        pod-security.kubernetes.io/audit: restricted
+        pod-security.kubernetes.io/warn: restricted
+    ```
+  </Accordion>
+
+  <Accordion title="Use NetworkPolicy for egress control">
+    Combine NetworkPolicy with Faramesh for defense-in-depth:
+    - NetworkPolicy: Network-level enforcement
+    - Faramesh: Application-level governance with context-aware rules
+  </Accordion>
+
+  <Accordion title="Encrypt DPR at rest">
+    Use encrypted PersistentVolumes:
+    ```yaml
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: faramesh-dpr
+    spec:
+      storageClassName: encrypted-ssd
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 10Gi
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Agent cannot connect to sidecar">
+    Check that the socket volume is mounted:
+    ```bash
+    kubectl exec -it <pod-name> -c agent -- ls -la /var/run/faramesh
+    ```
+
+    Check sidecar logs:
+    ```bash
+    kubectl logs <pod-name> -c faramesh
+    ```
+  </Accordion>
+
+  <Accordion title="Policy not loaded">
+    Verify the ConfigMap exists:
+    ```bash
+    kubectl get configmap faramesh-policy -o yaml
+    ```
+
+    Check the sidecar logs for policy validation errors:
+    ```bash
+    kubectl logs <pod-name> -c faramesh | grep policy
+    ```
+  </Accordion>
+
+  <Accordion title="High latency on decisions">
+    Increase sidecar CPU limits:
+    ```yaml
+    resources:
+      limits:
+        cpu: "2000m"
+    ```
+
+    Check for external selector timeouts (if using HTTP selectors).
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Policy Language" icon="file-lines" href="/concepts/policy-engine">
+    Write advanced Kubernetes-aware policies
+  </Card>
+  <Card title="Serverless Deployment" icon="cloud" href="/guides/serverless">
+    Deploy to AWS Lambda or Google Cloud Run
+  </Card>
+  <Card title="Cloud Platform" icon="globe" href="/guides/cloud-platform">
+    Sync policies and audit trails to Faramesh Cloud
+  </Card>
+  <Card title="DPR Chain" icon="link" href="/concepts/dpr-chain">
+    Verify audit chain integrity
+  </Card>
+</CardGroup>

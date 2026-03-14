@@ -1,0 +1,524 @@
+---
+title: Serverless Deployment
+description: Deploy Faramesh on AWS Lambda, Google Cloud Run, and Azure Functions with in-process governance
+---
+
+The **A4 (Serverless)** adapter runs Faramesh as an **in-process library** inside your serverless function. No network hop, no daemon, no sidecar. The governance engine runs directly in your Lambda or Cloud Run container, optimized for cold-start performance (&lt;50ms initialization).
+
+## Architecture
+
+```
+┌──────────────────────────────────────────┐
+│  Lambda / Cloud Run / Azure Function     │
+│                                          │
+│  ┌────────────────────────────────────┐ │
+│  │  Your Agent Code                   │ │
+│  │  (Python/Node/Go)                  │ │
+│  │                                    │ │
+│  │  governed_tool()                   │ │
+│  │         │                          │ │
+│  │         ▼                          │ │
+│  │  ┌──────────────────────┐         │ │
+│  │  │ Faramesh In-Process  │         │ │
+│  │  │ - Policy Engine      │         │ │
+│  │  │ - DPR Writer         │         │ │
+│  │  │ - Session State      │         │ │
+│  │  └──────────────────────┘         │ │
+│  │         │                          │ │
+│  │         ▼ PERMIT/DENY/DEFER        │ │
+│  │  actual_tool()                     │ │
+│  └────────────────────────────────────┘ │
+│                                          │
+│  Policy: env var or file in /tmp        │
+│  DPR: /tmp/faramesh-dpr.db (ephemeral)  │
+└──────────────────────────────────────────┘
+```
+
+No external daemon. No Unix socket. Everything runs in the same process as your agent.
+
+## AWS Lambda
+
+### Installation
+
+<Steps>
+  <Step title="Add Faramesh to your Lambda package">
+    ```bash
+    pip install faramesh -t ./package
+    cd package
+    zip -r ../lambda-package.zip .
+    cd ..
+    zip -g lambda-package.zip lambda_function.py
+    ```
+  </Step>
+
+  <Step title="Store policy in environment variable">
+    ```bash
+    export FARAMESH_POLICY=$(cat policy.yaml)
+    ```
+
+    Or store in AWS Systems Manager Parameter Store:
+    ```bash
+    aws ssm put-parameter \
+      --name /faramesh/payment-agent/policy \
+      --type String \
+      --value file://policy.yaml
+    ```
+  </Step>
+
+  <Step title="Write your Lambda handler">
+    ```python lambda_function.py
+    import os
+    import boto3
+    from faramesh.serverless import Guard
+    from faramesh import DenyError, DeferredError
+
+    # Initialize the guard once (reused across invocations)
+    guard = None
+
+    def init_guard():
+        global guard
+        if guard is None:
+            # Option 1: Load policy from environment variable
+            policy_yaml = os.getenv('FARAMESH_POLICY')
+            
+            # Option 2: Load from SSM Parameter Store
+            # ssm = boto3.client('ssm')
+            # response = ssm.get_parameter(Name='/faramesh/payment-agent/policy')
+            # policy_yaml = response['Parameter']['Value']
+            
+            guard = Guard({
+                'PolicyYAML': policy_yaml,
+                'AgentID': 'payment-agent',
+                'DPRPath': '/tmp/faramesh-dpr.db'  # Lambda's writable /tmp
+            })
+        return guard
+
+    def lambda_handler(event, context):
+        g = init_guard()
+        
+        # Extract tool call from event
+        tool_id = event['tool']
+        args = event['args']
+        
+        # Govern the call
+        decision = g.Govern(context, tool_id, args)
+        
+        if decision['Effect'] == 'DENY':
+            return {
+                'statusCode': 403,
+                'body': f"DENY: {decision['Reason']}"
+            }
+        
+        if decision['Effect'] == 'DEFER':
+            return {
+                'statusCode': 202,
+                'body': f"Requires approval: {decision['DeferToken']}"
+            }
+        
+        # PERMIT or SHADOW — execute the tool
+        result = execute_tool(tool_id, args)
+        
+        return {
+            'statusCode': 200,
+            'body': result
+        }
+
+    def execute_tool(tool_id, args):
+        # Your tool execution logic
+        if tool_id == 'stripe_refund':
+            # Call Stripe API
+            return f"Refunded {args['amount']} {args['currency']}"
+        return "OK"
+    ```
+  </Step>
+
+  <Step title="Deploy to Lambda">
+    ```bash
+    aws lambda create-function \
+      --function-name payment-agent \
+      --runtime python3.11 \
+      --role arn:aws:iam::123456789012:role/lambda-execution-role \
+      --handler lambda_function.lambda_handler \
+      --zip-file fileb://lambda-package.zip \
+      --environment Variables="{FARAMESH_POLICY=$(cat policy.yaml | jq -Rs .)}" \
+      --timeout 30 \
+      --memory-size 512
+    ```
+  </Step>
+</Steps>
+
+### Lambda Layer (Alternative)
+
+Package Faramesh as a Lambda Layer for easier reuse:
+
+```bash
+# Build the layer
+mkdir -p layer/python
+pip install faramesh -t layer/python
+cd layer
+zip -r ../faramesh-layer.zip .
+cd ..
+
+# Publish the layer
+aws lambda publish-layer-version \
+  --layer-name faramesh \
+  --zip-file fileb://faramesh-layer.zip \
+  --compatible-runtimes python3.11 python3.10
+
+# Add layer to your function
+aws lambda update-function-configuration \
+  --function-name payment-agent \
+  --layers arn:aws:lambda:us-east-1:123456789012:layer:faramesh:1
+```
+
+<Tip>
+  Faramesh publishes official Lambda layers. Check the [releases page](https://github.com/faramesh/faramesh-core/releases) for ARNs.
+</Tip>
+
+## Google Cloud Run
+
+### Dockerfile
+
+```dockerfile Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Copy policy file
+COPY policy.yaml /app/policy.yaml
+
+# Run the agent
+CMD ["python", "agent.py"]
+```
+
+### Agent Code
+
+```python agent.py
+import os
+from flask import Flask, request, jsonify
+from faramesh import govern, DenyError, DeferredError
+
+app = Flask(__name__)
+
+def stripe_refund(amount: float, currency: str) -> dict:
+    """Refund a charge via Stripe."""
+    # Your Stripe API call
+    return {"status": "success", "amount": amount}
+
+# Wrap with governance
+governed_refund = govern(
+    stripe_refund,
+    policy='policy.yaml',
+    agent_id='payment-agent',
+    auto_start=True  # Auto-start daemon on first call
+)
+
+@app.route('/refund', methods=['POST'])
+def refund():
+    data = request.json
+    try:
+        result = governed_refund(
+            amount=data['amount'],
+            currency=data['currency']
+        )
+        return jsonify(result)
+    except DenyError as e:
+        return jsonify({"error": e.reason, "code": e.reason_code}), 403
+    except DeferredError as e:
+        return jsonify({"error": "Requires approval", "token": e.defer_token}), 202
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
+```
+
+### Deploy to Cloud Run
+
+```bash
+# Build and push container
+gcloud builds submit --tag gcr.io/PROJECT_ID/payment-agent
+
+# Deploy to Cloud Run
+gcloud run deploy payment-agent \
+  --image gcr.io/PROJECT_ID/payment-agent \
+  --platform managed \
+  --region us-central1 \
+  --allow-unauthenticated \
+  --memory 512Mi \
+  --timeout 60s
+```
+
+<Note>
+  Cloud Run containers have an ephemeral filesystem at `/tmp`. DPR records persist only for the container's lifetime. Use Cloud SQL or Cloud Storage for persistent audit trails.
+</Note>
+
+## Azure Functions
+
+### function_app.py
+
+```python function_app.py
+import azure.functions as func
+import logging
+from faramesh import govern, DenyError, DeferredError
+
+app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
+
+def stripe_refund(amount: float, currency: str) -> dict:
+    """Refund a charge via Stripe."""
+    return {"status": "success", "amount": amount}
+
+governed_refund = govern(
+    stripe_refund,
+    policy='policy.yaml',
+    agent_id='payment-agent'
+)
+
+@app.route(route="refund")
+def refund(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info('Processing refund request')
+    
+    try:
+        req_body = req.get_json()
+        amount = req_body.get('amount')
+        currency = req_body.get('currency')
+        
+        result = governed_refund(amount=amount, currency=currency)
+        return func.HttpResponse(
+            f"Refunded {amount} {currency}",
+            status_code=200
+        )
+    except DenyError as e:
+        return func.HttpResponse(
+            f"DENY: {e.reason}",
+            status_code=403
+        )
+    except DeferredError as e:
+        return func.HttpResponse(
+            f"Requires approval: {e.defer_token}",
+            status_code=202
+        )
+```
+
+### Deploy
+
+```bash
+func azure functionapp publish payment-agent-func
+```
+
+## Environment-Based Configuration
+
+Load policies from environment variables for easier deployment:
+
+<CodeGroup>
+```python Python (govern)
+import os
+from faramesh import govern
+
+policy_yaml = os.getenv('FARAMESH_POLICY', 'policy.yaml')
+
+governed_tool = govern(
+    my_tool,
+    policy=policy_yaml,
+    agent_id=os.getenv('FARAMESH_AGENT_ID', 'default-agent')
+)
+```
+
+```python Python (serverless Guard)
+import os
+from faramesh.serverless import Guard
+
+guard = Guard({
+    'PolicyYAML': os.getenv('FARAMESH_POLICY'),  # Inline YAML
+    'AgentID': os.getenv('FARAMESH_AGENT_ID', 'serverless-agent'),
+    'DPRPath': '/tmp/faramesh-dpr.db'
+})
+```
+
+```bash Lambda Environment Variable
+FARAMESH_POLICY="faramesh-version: '1.0'
+agent-id: payment-agent
+default_effect: permit
+rules:
+  - id: deny-high-refunds
+    match:
+      tool: stripe_refund
+      when: 'args[\"amount\"] > 1000'
+    effect: deny"
+```
+</CodeGroup>
+
+## Cold-Start Optimization
+
+The serverless adapter is optimized for cold-start performance:
+
+- **Policy compilation**: ~20ms (on first invocation)
+- **Guard initialization**: ~30ms total
+- **Per-decision latency**: ~1-5ms (policy evaluation + DPR write)
+
+<Tip>
+  Keep your policy file small (&lt;100 rules) for fastest cold starts. Use the Cloud Platform for large policy sets with caching.
+</Tip>
+
+### Warm-Up Strategy
+
+```python
+# Initialize the guard at module level (outside handler)
+from faramesh.serverless import Guard
+import os
+
+guard = Guard({
+    'PolicyYAML': os.getenv('FARAMESH_POLICY'),
+    'AgentID': 'payment-agent',
+    'DPRPath': '/tmp/faramesh-dpr.db'
+})
+
+def lambda_handler(event, context):
+    # Guard is already initialized — no cold-start penalty
+    decision = guard.Govern(context, event['tool'], event['args'])
+    ...
+```
+
+## Persistent Audit Trail
+
+Serverless functions have ephemeral filesystems. Persist the DPR chain externally:
+
+### AWS Lambda + S3
+
+```python
+import boto3
+import os
+from faramesh.serverless import Guard
+
+s3 = boto3.client('s3')
+BUCKET = 'my-faramesh-audit-bucket'
+DPR_KEY = 'dpr/faramesh.db'
+
+def lambda_handler(event, context):
+    # Download existing DPR from S3
+    try:
+        s3.download_file(BUCKET, DPR_KEY, '/tmp/faramesh-dpr.db')
+    except:
+        pass  # New DPR
+    
+    # Initialize guard
+    guard = Guard({
+        'PolicyYAML': os.getenv('FARAMESH_POLICY'),
+        'DPRPath': '/tmp/faramesh-dpr.db'
+    })
+    
+    # Process request
+    decision = guard.Govern(context, event['tool'], event['args'])
+    
+    # Upload DPR back to S3
+    s3.upload_file('/tmp/faramesh-dpr.db', BUCKET, DPR_KEY)
+    
+    return {"statusCode": 200, "body": "OK"}
+```
+
+### Google Cloud Run + Cloud SQL
+
+```python
+import os
+from faramesh.serverless import Guard
+from google.cloud.sql.connector import Connector
+
+# Use Cloud SQL for DPR storage
+connector = Connector()
+conn = connector.connect(
+    "project:region:instance",
+    "pg8000",
+    user="postgres",
+    password=os.getenv("DB_PASS"),
+    db="faramesh"
+)
+
+guard = Guard({
+    'PolicyYAML': os.getenv('FARAMESH_POLICY'),
+    'DPRPath': 'postgresql://user:pass@/faramesh?host=/cloudsql/project:region:instance'
+})
+```
+
+## Cost Optimization
+
+<AccordionGroup>
+  <Accordion title="Use smaller memory allocations">
+    Faramesh has a small footprint (~50MB resident):
+    - **Lambda**: 256-512MB is sufficient for most workloads
+    - **Cloud Run**: 512Mi default works well
+  </Accordion>
+
+  <Accordion title="Minimize policy size">
+    Smaller policies = faster cold starts:
+    - Keep rules under 100 for sub-50ms initialization
+    - Use the Cloud Platform for large policy sets with caching
+  </Accordion>
+
+  <Accordion title="Reuse connections across invocations">
+    Initialize the `Guard` at module level (outside the handler) to reuse it across warm invocations.
+  </Accordion>
+
+  <Accordion title="Use SHADOW mode for testing">
+    Set `effect: shadow` to observe tool calls without blocking them. Shadow mode has zero runtime impact.
+  </Accordion>
+</AccordionGroup>
+
+## DEFER in Serverless
+
+DEFER workflow works differently in serverless:
+
+1. **Synchronous DEFER**: Return a 202 status with the defer token. The client must poll for approval.
+2. **Async DEFER**: Use SNS/Pub/Sub to notify approvers, then trigger the function again after approval.
+
+### Example: SQS-Backed DEFER
+
+```python
+import boto3
+from faramesh.serverless import Guard
+
+sqs = boto3.client('sqs')
+QUEUE_URL = 'https://sqs.us-east-1.amazonaws.com/123456789012/faramesh-defers'
+
+def lambda_handler(event, context):
+    guard = Guard({'PolicyYAML': os.getenv('FARAMESH_POLICY')})
+    decision = guard.Govern(context, event['tool'], event['args'])
+    
+    if decision['Effect'] == 'DEFER':
+        # Send defer token to SQS for approval workflow
+        sqs.send_message(
+            QueueUrl=QUEUE_URL,
+            MessageBody=json.dumps({
+                'defer_token': decision['DeferToken'],
+                'tool': event['tool'],
+                'args': event['args'],
+                'reason': decision['Reason']
+            })
+        )
+        return {"statusCode": 202, "body": "Awaiting approval"}
+    
+    # Execute tool
+    ...
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Kubernetes" icon="dharmachakra" href="/guides/kubernetes">
+    Deploy with sidecar injection on Kubernetes
+  </Card>
+  <Card title="Cloud Platform" icon="cloud" href="/guides/cloud-platform">
+    Sync policies and DPR to Faramesh Cloud
+  </Card>
+  <Card title="Policy Language" icon="file-lines" href="/concepts/policy-engine">
+    Write serverless-optimized policies
+  </Card>
+  <Card title="DPR Chain" icon="link" href="/concepts/dpr-chain">
+    Verify audit chain integrity
+  </Card>
+</CardGroup>

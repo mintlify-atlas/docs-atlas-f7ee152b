@@ -1,0 +1,460 @@
+---
+title: Multi-Agent Governance
+description: Cross-agent coordination, shared budgets, session state governance, and delegation chains
+---
+
+## Why Multi-Agent Governance?
+
+Modern AI systems are increasingly **multi-agent**: orchestrators that spawn sub-agents, critique loops, fan-out parallelism, and cross-agent coordination. Governing a single agent is insufficient — you need:
+
+- **Shared budgets** across parallel agents
+- **Session state governance** to prevent cross-agent interference
+- **Delegation chains** to track which agent invoked which
+- **Loop detection** to prevent infinite recursion
+- **Aggregate limits** to prevent swarm runaway
+
+Faramesh's multi-agent subsystem (`internal/core/multiagent/`) provides all of this.
+
+---
+
+## Shared Budget Management
+
+In fan-out scenarios, multiple agents operate under a **single aggregate budget**. Each agent gets a slice of the total, and exceeding any limit triggers cancellation.
+
+### Budget Manager
+
+From `internal/core/multiagent/budget.go`:
+
+```go multiagent/budget.go
+type BudgetManager struct {
+    mu             sync.Mutex
+    sessionID      string
+    aggregateMax   float64
+    aggregateSpent float64
+    agents         map[string]*AgentBudget
+    onExceed       func(agentID string, spent, limit float64)
+}
+
+type AgentBudget struct {
+    AgentID      string  `json:"agent_id"`
+    MaxCostUSD   float64 `json:"max_cost_usd"`
+    SpentUSD     float64 `json:"spent_usd"`
+    ReservedUSD  float64 `json:"reserved_usd"`
+    Cancelled    bool    `json:"cancelled"`
+}
+```
+
+### Policy Configuration
+
+```yaml
+parallel_budget:
+  orchestration_id: payment-orchestrator
+  agents:
+    - refund-processor
+    - fraud-checker
+    - notification-sender
+  aggregate_max_cost_usd: 10.00
+  per_agent_max_cost_usd: 4.00
+  on_aggregate_exceed: cancel_remaining  # or "deny"
+```
+
+### Usage
+
+```go
+bm := multiagent.NewBudgetManager("session-123", 10.00)
+
+// Allocate budgets
+bm.AllocateAgent("refund-processor", 4.00)
+bm.AllocateAgent("fraud-checker", 3.00)
+bm.AllocateAgent("notification-sender", 3.00)
+
+// Record cost
+shouldCancel, err := bm.RecordCost("refund-processor", 2.50)
+if shouldCancel {
+    // Cancel agent
+}
+
+// Check status
+status := bm.Status()
+fmt.Printf("Aggregate: $%.2f / $%.2f\n", status.AggregateSpent, status.AggregateMax)
+```
+
+When the aggregate limit is exceeded, **all remaining agents are cancelled**:
+
+```go multiagent/budget.go:104
+if bm.aggregateSpent > bm.aggregateMax {
+    shouldCancel = true
+    // Cancel all remaining agents.
+    for _, a := range bm.agents {
+        if !a.Cancelled {
+            a.Cancelled = true
+            if bm.onExceed != nil {
+                bm.onExceed(a.AgentID, bm.aggregateSpent, bm.aggregateMax)
+            }
+        }
+    }
+    return true, nil
+}
+```
+
+---
+
+## Session State Governance
+
+When multiple agents share session state (e.g., Redis), you need to prevent:
+
+- **Cross-agent interference**: Agent A overwrites Agent B's keys
+- **Injection attacks**: Agent B writes malicious data that Agent A executes
+- **PII leakage**: Agent A reads Agent B's customer data
+
+Faramesh provides **namespace isolation** and **write scanning**.
+
+### Session Governor
+
+From `internal/core/multiagent/sessiongov.go`:
+
+```go multiagent/sessiongov.go
+type SessionGovernor struct {
+    mu            sync.RWMutex
+    namespaces    map[string]StateNamespace
+    keySchemas    map[string]KeySchema
+    piiPatterns   []*regexp.Regexp
+    secretPattern *regexp.Regexp
+}
+
+type StateNamespace struct {
+    AgentID string
+    Prefix  string  // "agent:{agentID}:"
+}
+```
+
+### Namespace Isolation
+
+Each agent gets a private namespace:
+
+```go
+ns := multiagent.NewStateNamespace("refund-processor")
+// ns.Prefix = "agent:refund-processor:"
+
+key := ns.ScopedKey("last_refund_id")
+// key = "agent:refund-processor:last_refund_id"
+
+redis.Set(key, "ref_12345")
+```
+
+Shared keys use the `shared:` prefix:
+
+```go
+redis.Set("shared:orchestrator_status", "running")
+```
+
+### Write Scanning
+
+Before writing to session state, the governor scans for:
+
+- **Injection patterns**: SQL injection, XSS
+- **PII**: Emails, SSNs, credit cards
+- **Secrets**: API keys, passwords
+
+```go multiagent/sessiongov.go:107
+func (sg *SessionGovernor) CanWrite(agentID, key string, value any) (bool, *WriteScanResult) {
+    result := &WriteScanResult{Key: key}
+
+    // Check namespace ownership
+    if hasNS && !ns.IsOwned(key) && !SharedKey(key) {
+        result.Violations = append(result.Violations,
+            fmt.Sprintf("agent %s cannot write to key %s (not in namespace)", agentID, key))
+        return false, result
+    }
+
+    // Scan value for injection, PII, secrets
+    if strVal, ok := value.(string); ok {
+        sg.scanValue(strVal, result)
+    }
+
+    return len(result.Violations) == 0 && !result.InjectionRisk && !result.SecretsFound, result
+}
+```
+
+Scan result:
+
+```go
+type WriteScanResult struct {
+    Key           string
+    InjectionRisk bool
+    PIIDetected   []string
+    SecretsFound  bool
+    Violations    []string
+}
+```
+
+### Policy Configuration
+
+```yaml
+session_state_policy:
+  agent_id: refund-processor
+  declared_keys:
+    - key: last_refund_id
+      type: string
+      max_length: 32
+      scan: [injection, secret]
+    - key: refund_count
+      type: number
+  undeclared_key_policy: deny
+  write_scan:
+    injection_detection: true
+    pii_scan: true
+    secret_scan: true
+```
+
+---
+
+## Delegation Chains
+
+When Agent A invokes Agent B, Faramesh tracks the **delegation chain** in the DPR:
+
+```go internal/core/dpr/record.go
+type Record struct {
+    // ...
+    InvokedByAgentID    string `json:"invoked_by_agent_id,omitempty"`
+    InvokedByDPRID      string `json:"invoked_by_dpr_record_id,omitempty"`
+    InnerGovernanceDPRID string `json:"inner_governance_dpr_record_id,omitempty"`
+}
+```
+
+Audit trail:
+
+```
+Orchestrator (payment-bot)
+  └─ DPR abc123 [PERMIT stripe/refund]
+       └─ invokes Sub-Agent (refund-processor)
+            └─ DPR def456 [PERMIT stripe.Refund.create]
+                 invoked_by_agent_id: payment-bot
+                 invoked_by_dpr_id: abc123
+```
+
+### Delegation Context in Policies
+
+Policies can reference delegation depth:
+
+```yaml
+- id: limit-delegation-depth
+  match:
+    tool: "*"
+    when: 'delegation.depth > 3'
+  effect: deny
+  reason: delegation chain too deep (max 3 levels)
+
+- id: require-verified-origin
+  match:
+    tool: "shell/*"
+    when: '!delegation.agent_identity_verified'
+  effect: deny
+  reason: shell access requires verified delegation chain
+```
+
+Delegation context from `internal/core/policy/engine.go`:
+
+```go policy/engine.go:99
+type DelegationCtx struct {
+    Depth                  int    `expr:"depth"`
+    OriginAgent            string `expr:"origin_agent"`
+    OriginOrg              string `expr:"origin_org"`
+    AgentIdentityVerified  bool   `expr:"agent_identity_verified"`
+}
+```
+
+---
+
+## Loop Detection
+
+Critique loops (Agent → Critic → Agent → ...) can run indefinitely. Faramesh detects loops and enforces limits:
+
+```yaml
+loop_governance:
+  agent_id: critique-loop
+  max_iterations: 10
+  max_total_cost_usd: 5.00
+  max_duration_seconds: 300
+  on_max_reached: deny
+  convergence_tracking:
+    scan_results_across_iterations: true
+    repeated_scan_threshold: 3
+    on_evasion: defer  # Agent is optimizing against governance
+```
+
+Implementation in `internal/core/multiagent/loops.go`:
+
+```go
+type LoopTracker struct {
+    iterations      int
+    totalCostUSD    float64
+    startTime       time.Time
+    scanHistory     []ScanResult
+    maxIterations   int
+    maxCostUSD      float64
+    maxDurationSecs int
+}
+
+func (lt *LoopTracker) RecordIteration(costUSD float64, scanResult ScanResult) (bool, string) {
+    lt.iterations++
+    lt.totalCostUSD += costUSD
+    lt.scanHistory = append(lt.scanHistory, scanResult)
+
+    if lt.iterations > lt.maxIterations {
+        return true, "max_iterations_reached"
+    }
+    if lt.totalCostUSD > lt.maxCostUSD {
+        return true, "max_cost_reached"
+    }
+    if time.Since(lt.startTime).Seconds() > float64(lt.maxDurationSecs) {
+        return true, "max_duration_reached"
+    }
+
+    // Detect evasion: same scan result repeated N times
+    if countRepeated(lt.scanHistory, scanResult) > 3 {
+        return true, "evasion_detected"
+    }
+
+    return false, ""
+}
+```
+
+---
+
+## Orchestrator Manifest
+
+Orchestrators declare all permitted sub-agent invocations:
+
+```yaml
+orchestrator_manifest:
+  agent_id: payment-orchestrator
+  permitted_invocations:
+    - agent_id: refund-processor
+      max_invocations_per_session: 5
+      requires_prior_approval: false
+
+    - agent_id: fraud-checker
+      max_invocations_per_session: 1
+      requires_prior_approval: false
+
+    - agent_id: manual-refund-agent
+      max_invocations_per_session: 1
+      requires_prior_approval: true  # DEFER before invoke
+
+  undeclared_invocation_policy: deny
+```
+
+If an orchestrator tries to invoke an undeclared agent → DENY.
+
+---
+
+## Cross-Agent Coordination
+
+Faramesh provides primitives for coordination:
+
+### Cryptographic Seals
+
+From `internal/core/multiagent/seals.go`:
+
+```go
+type SessionSeal struct {
+    SessionID   string
+    AgentIDs    []string
+    Timestamp   time.Time
+    Signature   string  // HMAC-SHA256
+}
+
+func (s *SessionSeal) Sign(secret string) {
+    canonical := fmt.Sprintf("%s:%s:%d", s.SessionID, strings.Join(s.AgentIDs, ","), s.Timestamp.Unix())
+    mac := hmac.New(sha256.New, []byte(secret))
+    mac.Write([]byte(canonical))
+    s.Signature = hex.EncodeToString(mac.Sum(nil))
+}
+```
+
+### Cross-Agent State Sync
+
+From `internal/core/multiagent/sync.go`:
+
+```go
+type StateSync struct {
+    mu     sync.RWMutex
+    states map[string]map[string]any  // agentID → state
+}
+
+func (ss *StateSync) BroadcastState(agentID string, state map[string]any) {
+    ss.mu.Lock()
+    defer ss.mu.Unlock()
+    ss.states[agentID] = state
+}
+
+func (ss *StateSync) GetAgentState(agentID string) map[string]any {
+    ss.mu.RLock()
+    defer ss.mu.RUnlock()
+    return ss.states[agentID]
+}
+```
+
+---
+
+## Example: Payment Orchestrator
+
+```yaml payment-orchestrator.yaml
+faramesh-version: '1.0'
+agent-id: payment-orchestrator
+
+parallel_budget:
+  orchestration_id: payment-flow
+  agents: [refund-processor, fraud-checker, notification-sender]
+  aggregate_max_cost_usd: 10.00
+  per_agent_max_cost_usd: 4.00
+  on_aggregate_exceed: cancel_remaining
+
+orchestrator_manifest:
+  agent_id: payment-orchestrator
+  permitted_invocations:
+    - agent_id: refund-processor
+      max_invocations_per_session: 3
+    - agent_id: fraud-checker
+      max_invocations_per_session: 1
+  undeclared_invocation_policy: deny
+
+session_state_policy:
+  agent_id: payment-orchestrator
+  declared_keys:
+    - key: orchestrator_status
+      type: string
+    - key: total_refunded_usd
+      type: number
+  write_scan:
+    injection_detection: true
+    secret_scan: true
+
+rules:
+  - id: defer-high-value-orchestration
+    match:
+      tool: "invoke_agent"
+      when: 'args["total_amount"] > 1000'
+    effect: defer
+    reason: high-value orchestration requires approval
+```
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand the invariant core
+  </Card>
+  <Card title="Policy Engine" icon="gavel" href="/concepts/policy-engine">
+    Write multi-agent policies
+  </Card>
+  <Card title="Session State" icon="database" href="/reference/session-state">
+    Configure Redis backend
+  </Card>
+  <Card title="Orchestration Guide" icon="sitemap" href="/concepts/multi-agent">
+    Build governed multi-agent systems
+  </Card>
+</CardGroup>

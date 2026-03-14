@@ -1,0 +1,280 @@
+---
+title: "govern() Decorator"
+description: "API reference for the govern() decorator that adds governance to Python functions"
+icon: "function"
+---
+
+## Function signature
+
+```python
+def govern(
+    fn: Callable,
+    *,
+    policy: str = "policy.yaml",
+    agent_id: str | None = None,
+    tool_id: str | None = None,
+    socket_path: str = "/tmp/faramesh.sock",
+    auto_start: bool = True,
+) -> Callable:
+    ...
+```
+
+## Description
+
+Wraps a function with Faramesh governance. Every invocation of the wrapped function is evaluated against the policy before execution.
+
+The decorator preserves the original function's:
+- Signature and type hints
+- Docstring and `__name__`
+- `__module__` and `__qualname__`
+- LangChain `@tool` metadata (`.name`, `.description`, `.args_schema`)
+- Pydantic model parameters
+
+## Parameters
+
+<ParamField path="fn" type="Callable" required>
+  The function to govern. Can be any callable: plain functions, methods, lambdas, or framework-decorated functions (LangChain `@tool`, etc.).
+</ParamField>
+
+<ParamField path="policy" type="str" default="policy.yaml">
+  Path to the policy YAML file. Can be absolute or relative to the current working directory.
+
+  ```python
+  @govern(policy="policies/production.yaml")
+  def my_tool():
+      pass
+  ```
+</ParamField>
+
+<ParamField path="agent_id" type="str | None" default="None">
+  Agent identity string. Used to correlate tool calls in the audit log and to scope sessions.
+
+  **Default behavior:** If not specified, defaults to `{module}.{qualname}` (e.g., `"myapp.agents.Agent.run"`).
+
+  ```python
+  @govern(agent_id="payment-bot")
+  def process_refund():
+      pass
+  ```
+
+  The agent ID is logged in every audit entry and used for session tracking across multiple tool calls.
+</ParamField>
+
+<ParamField path="tool_id" type="str | None" default="None">
+  Tool identifier used to match against policy rules.
+
+  **Default behavior:** If not specified, defaults to the function's `__name__`.
+
+  ```python
+  @govern(tool_id="delete_user")
+  def delete_user_account(user_id: str):
+      pass
+  ```
+
+  This is the identifier you reference in your policy YAML:
+
+  ```yaml
+  tools:
+    - name: delete_user
+      rules:
+        - effect: DENY
+  ```
+</ParamField>
+
+<ParamField path="socket_path" type="str" default="/tmp/faramesh.sock">
+  Path to the Unix domain socket for communicating with the Faramesh daemon.
+
+  ```python
+  @govern(socket_path="/var/run/faramesh/faramesh.sock")
+  def my_tool():
+      pass
+  ```
+
+  In production, you may run the daemon with a custom socket location:
+
+  ```bash
+  faramesh serve --socket /var/run/faramesh/faramesh.sock
+  ```
+</ParamField>
+
+<ParamField path="auto_start" type="bool" default="True">
+  If `True`, automatically download and start the Faramesh daemon on the first call. Recommended for development.
+
+  If `False`, assumes the daemon is already running. Recommended for production environments where the daemon is managed separately (systemd, Docker, Kubernetes, etc.).
+
+  ```python
+  # Development: auto-start enabled
+  @govern(auto_start=True)
+  def dev_tool():
+      pass
+
+  # Production: daemon managed externally
+  @govern(auto_start=False)
+  def prod_tool():
+      pass
+  ```
+</ParamField>
+
+## Return value
+
+Returns a wrapped function with the same signature, type hints, and metadata as the original. The wrapper:
+
+1. Calls the Faramesh daemon with the tool invocation details
+2. Waits for a governance decision (`PERMIT`, `DENY`, `DEFER`, or `SHADOW`)
+3. Raises `DenyError` if the policy denies the call
+4. Blocks on `DEFER` until human approval (or raises `DeferredError` on timeout/denial)
+5. Executes the original function if approved or permitted
+6. Returns the original function's return value
+
+## Behavior by policy effect
+
+| Effect | Behavior |
+|--------|----------|
+| `PERMIT` | Execute the function immediately and return its result |
+| `DENY` | Raise `DenyError` without executing the function |
+| `DEFER` | Block until human approval, then execute (or raise `DeferredError`) |
+| `SHADOW` | Log the call but execute the function immediately |
+
+## Usage patterns
+
+### As a decorator
+
+```python
+from faramesh import govern
+
+@govern
+def send_email(to: str, subject: str, body: str):
+    # Implementation
+    pass
+```
+
+### As a wrapper function
+
+```python
+from faramesh import govern
+import third_party_library
+
+# Wrap a function from a library you don't control
+governed_delete = govern(
+    third_party_library.delete_record,
+    policy="policy.yaml",
+    tool_id="delete_record"
+)
+
+result = governed_delete(record_id=123)
+```
+
+### With custom parameters
+
+```python
+@govern(
+    policy="policies/production.yaml",
+    agent_id="customer-support-bot",
+    tool_id="refund_order",
+    socket_path="/var/run/faramesh.sock",
+    auto_start=False
+)
+def refund_order(order_id: str, amount: float, reason: str):
+    # Implementation
+    pass
+```
+
+### Accessing the original function
+
+The wrapped function stores a reference to the original via `__wrapped__`:
+
+```python
+governed_func = govern(my_function)
+
+# Call the governed version
+governed_func(args)
+
+# Bypass governance and call the original
+governed_func.__wrapped__(args)
+```
+
+## Argument serialization
+
+The decorator automatically serializes function arguments for policy evaluation:
+
+- **Primitives** (`str`, `int`, `float`, `bool`, `None`) → passed as-is
+- **Lists and dicts** → recursively serialized
+- **Pydantic models** → serialized via `.model_dump()` (v2) or `.dict()` (v1)
+- **Other objects** → converted to JSON-safe representation via `str()`
+
+Example:
+
+```python
+from pydantic import BaseModel
+
+class User(BaseModel):
+    id: int
+    email: str
+
+@govern
+def delete_user(user: User):
+    pass
+
+# The policy sees: {"id": 123, "email": "alice@example.com"}
+delete_user(User(id=123, email="alice@example.com"))
+```
+
+This allows you to write policy conditions like:
+
+```yaml
+tools:
+  - name: delete_user
+    rules:
+      - when: 'args.user.email matches ".*@admin\\.com"'
+        effect: DENY
+```
+
+## Exception handling
+
+The governed function may raise:
+
+- **`DenyError`** — Policy explicitly denied the call
+- **`DeferredError`** — Call required approval but timed out or was denied
+- **`DaemonError`** — Cannot connect to the daemon (not running or socket issue)
+- **Original function exceptions** — If the call is permitted, any exception from the original function propagates normally
+
+See [Exception types](/sdk/exceptions) for details.
+
+## Thread safety
+
+The `govern()` decorator is thread-safe. Multiple threads can call governed functions concurrently. The SDK uses a shared `FarameshClient` instance with internal locking.
+
+## Performance
+
+Typical governance overhead:
+- **Local daemon:** < 5ms added latency
+- **Network daemon:** 10-50ms depending on network conditions
+- **DEFER blocking:** Variable (depends on human response time)
+
+## LangChain integration
+
+The decorator preserves LangChain `@tool` metadata:
+
+```python
+from langchain_core.tools import tool
+from faramesh import govern
+
+@tool
+def search(query: str) -> str:
+    """Search the knowledge base."""
+    return "results"
+
+governed = govern(search)
+
+# Metadata is preserved
+assert governed.name == "search"
+assert governed.description == "Search the knowledge base."
+assert governed.args_schema is not None
+```
+
+## See also
+
+- [Exception types](/sdk/exceptions) — Handle governance errors
+- [Configuration](/sdk/configuration) — Configure socket paths and timeouts
+- [Policy reference](/policies/writing-policies) — Write governance rules
+- [Python SDK overview](/sdk/python) — Installation and quick start

@@ -1,0 +1,405 @@
+---
+title: Writing Policies
+description: Learn how to write effective Faramesh policies to govern AI agent behavior
+icon: pen-to-square
+---
+
+Faramesh policies are YAML files that define governance rules for AI agent tool calls. This guide covers the fundamentals of writing, testing, and deploying policies.
+
+## Policy File Structure
+
+Every Faramesh policy file follows this basic structure:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: my-agent
+default_effect: deny
+
+vars:
+  max_refund: 500
+  allowed_domains:
+    - internal.example.com
+    - api.company.com
+
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    tags: [financial]
+
+rules:
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold and requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+```
+
+### Top-Level Fields
+
+<ParamField path="faramesh-version" type="string" required>
+  Policy language version. Always `"1.0"` for current policies.
+</ParamField>
+
+<ParamField path="agent-id" type="string" required>
+  Identifier for this policy. Used in audit logs and telemetry.
+</ParamField>
+
+<ParamField path="default_effect" type="string" default="deny">
+  Effect applied when no rule matches: `permit`, `deny`, or `defer`.
+</ParamField>
+
+<ParamField path="vars" type="object">
+  Policy-level variables accessible in `when:` expressions as `vars["key"]`.
+</ParamField>
+
+<ParamField path="tools" type="object">
+  Tool metadata declarations. See [Policy Schema](/policies/policy-schema#tools).
+</ParamField>
+
+<ParamField path="rules" type="array" required>
+  Ordered list of governance rules. First matching rule wins.
+</ParamField>
+
+## How Rule Matching Works
+
+Faramesh evaluates rules in **document order** with **first-match-wins** semantics:
+
+1. For each incoming tool call, iterate through `rules` from top to bottom
+2. Check if the rule's `tool` pattern matches the tool ID
+3. If matched, evaluate the `when` expression (if present)
+4. If both match, apply the rule's `effect` and stop
+5. If no rule matches, apply `default_effect`
+
+<Warning>
+Rule order matters! Place specific rules before broad catch-all patterns.
+
+```yaml
+# ✅ GOOD: Specific before general
+rules:
+  - match: { tool: "stripe/refund", when: 'args["amount"] > 500' }
+    effect: defer
+  - match: { tool: "stripe/*" }
+    effect: permit
+
+# ❌ BAD: General rule shadows specific rule
+rules:
+  - match: { tool: "stripe/*" }
+    effect: permit
+  - match: { tool: "stripe/refund", when: 'args["amount"] > 500' }
+    effect: defer  # UNREACHABLE!
+```
+</Warning>
+
+## Writing Your First Rules
+
+### 1. Block Destructive Shell Commands
+
+```yaml
+rules:
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs" || args["cmd"] matches "dd if="'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+    incident_category: destructive_command
+    incident_severity: critical
+```
+
+**Key concepts:**
+- `tool: shell/run` matches exactly the `shell/run` tool ID
+- `when:` uses expr-lang to inspect `args["cmd"]`
+- `matches` operator tests regex patterns
+- Multiple conditions combined with `||` (OR)
+
+### 2. Require Approval for High-Value Operations
+
+```yaml
+rules:
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold and requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+    incident_category: financial_threshold
+    incident_severity: high
+```
+
+**Key concepts:**
+- `effect: defer` pauses execution and routes to human review
+- `vars["max_refund"]` references policy variables
+- `reason` shown to human reviewer
+- `reason_code` used for analytics and automation
+
+### 3. Permit Normal Operations
+
+```yaml
+rules:
+  - id: permit-normal-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] <= vars["max_refund"]'
+    effect: permit
+    reason: refund within authorized threshold
+    reason_code: WITHIN_THRESHOLD
+```
+
+### 4. Default Deny Catch-All
+
+```yaml
+rules:
+  # ... specific rules above ...
+  
+  - id: default-deny
+    match:
+      tool: "*"
+    effect: deny
+    reason: no matching rule — default deny
+    reason_code: DEFAULT_DENY
+```
+
+## Tool Pattern Matching
+
+The `tool:` field supports glob-style patterns:
+
+| Pattern | Matches | Example |
+|---------|---------|----------|
+| `stripe/refund` | Exact match | Only `stripe/refund` |
+| `stripe/*` | Prefix match | `stripe/refund`, `stripe/charge`, `stripe/customer` |
+| `*/read` | Suffix match | `file/read`, `db/read` |
+| `*` | All tools | Everything (catch-all) |
+
+## Rule Effects
+
+<ParamField path="permit" type="effect">
+  Allow the tool call to execute immediately. Appears in audit log as `PERMIT`.
+</ParamField>
+
+<ParamField path="deny" type="effect">
+  Block the tool call. Agent receives error message. Appears in audit log as `DENY`.
+</ParamField>
+
+<ParamField path="defer" type="effect">
+  Pause execution and route to human review. Agent is notified that approval is required. Use for high-stakes operations.
+</ParamField>
+
+<ParamField path="shadow" type="effect">
+  (Advanced) Simulate execution without side effects. Used for testing new tools in production.
+</ParamField>
+
+## Using Variables
+
+Define reusable values in the `vars:` block:
+
+```yaml
+vars:
+  max_refund: 500
+  max_email_recipients: 50
+  allowed_domains:
+    - internal.example.com
+    - api.company.com
+  approved_accounts:
+    - acct_1234
+    - acct_5678
+
+rules:
+  - id: check-refund-threshold
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+
+  - id: check-email-recipients
+    match:
+      tool: send_email
+      when: 'len(args["recipients"]) > vars["max_email_recipients"]'
+    effect: deny
+
+  - id: check-approved-account
+    match:
+      tool: stripe/refund
+      when: 'contains(vars["approved_accounts"], args["account_id"])'
+    effect: permit
+```
+
+## Declaring Tool Metadata
+
+The `tools:` block declares metadata used in policy conditions:
+
+```yaml
+tools:
+  stripe/refund:
+    reversibility: compensatable     # irreversible | reversible | compensatable
+    blast_radius: external           # none | local | scoped | system | external
+    shadow_safe: false
+    tags: [financial, customer_impact]
+    cost_usd: 0.50
+
+  shell/run:
+    reversibility: irreversible
+    blast_radius: local
+    tags: [system]
+
+  read_customer:
+    reversibility: read_only
+    blast_radius: none
+    tags: [pii_source]
+```
+
+You can reference tool metadata in `when:` expressions:
+
+```yaml
+rules:
+  - id: defer-irreversible-external
+    match:
+      tool: "*"
+      when: 'tool.reversibility == "irreversible" && tool.blast_radius == "external"'
+    effect: defer
+    reason: irreversible external action requires approval
+
+  - id: defer-financial-tools
+    match:
+      tool: "*"
+      when: 'contains(tool.tags, "financial")'
+    effect: defer
+```
+
+## Validating Policies
+
+Always validate policies before deployment:
+
+```bash
+faramesh policy validate policies/payment.yaml
+```
+
+Validation checks:
+- ✅ YAML syntax correctness
+- ✅ All `when:` expressions compile
+- ✅ No duplicate rule IDs
+- ✅ Valid effect values (`permit`, `deny`, `defer`, `shadow`)
+- ⚠️ Warnings for unreachable rules (shadowed by earlier patterns)
+
+**Example output:**
+
+```bash
+✓ policies/payment.yaml  [a3f2b1c0]  5 rules  agent=payment-agent
+```
+
+**With warnings:**
+
+```bash
+⚠ warning: rule "permit-small-refund" (index 2, tool="stripe/refund") may be unreachable:
+  earlier rule "permit-all-stripe" (index 1, tool="stripe/*") matches all the same tools
+✓ policies/payment.yaml  [a3f2b1c0]  5 rules  agent=payment-agent  (1 warning(s))
+```
+
+## Testing Policies
+
+Test individual tool calls without running the daemon:
+
+```bash
+faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":600}'
+```
+
+**Example output:**
+
+```
+  Tool:    stripe/refund
+  Effect:  DEFER
+  Rule:    defer-high-value-refund
+  Reason:  refund exceeds threshold and requires finance approval
+  Code:    HIGH_VALUE_REFUND
+```
+
+Test with different argument values:
+
+```bash
+# Should DEFER (amount > 500)
+faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":600}'
+
+# Should PERMIT (amount <= 500)
+faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":100}'
+
+# Should DENY (destructive command)
+faramesh policy test policy.yaml --tool shell/run --args '{"cmd":"rm -rf /"}'
+```
+
+## Inspecting Policies
+
+View a policy summary:
+
+```bash
+faramesh policy inspect policy.yaml
+```
+
+**Example output:**
+
+```
+Policy: policies/demo.yaml
+  version    : a3f2b1c04df8e921
+  agent-id   : demo-agent
+  fpl        : 1.0
+  rules      : 4
+  tools      : 5 declared
+  default    : permit
+
+Rules:
+  deny      deny-destructive-shell          tool=shell/run  when="args[...]"
+  defer     defer-high-value-refund          tool=stripe/refund  when="args[...]"
+  permit    permit-normal-refund             tool=stripe/refund  when="args[...]"
+  deny      default-deny                     tool=*
+```
+
+## Policy Deployment Workflow
+
+1. **Write** your policy in YAML
+2. **Validate** with `faramesh policy validate`
+3. **Test** edge cases with `faramesh policy test`
+4. **Compare** with existing policy using `faramesh policy diff old.yaml new.yaml`
+5. **Deploy** by updating the policy file on disk
+6. **Reload** the daemon with `faramesh policy reload` (sends SIGHUP for hot reload)
+
+## Best Practices
+
+<Card title="Start with Default Deny" icon="shield">
+  Set `default_effect: deny` and explicitly permit safe operations. This follows the principle of least privilege.
+</Card>
+
+<Card title="Order Rules Carefully" icon="list-ol">
+  Place specific, high-priority rules first. Put catch-all patterns last.
+</Card>
+
+<Card title="Use Descriptive IDs" icon="tag">
+  Rule IDs appear in audit logs. Use clear, searchable names like `defer-high-value-refund` not `rule-1`.
+</Card>
+
+<Card title="Provide Clear Reasons" icon="message">
+  The `reason` field is shown to humans during review. Make it actionable.
+</Card>
+
+<Card title="Test in CI" icon="check">
+  Run `faramesh policy validate` in CI to catch errors before deployment.
+</Card>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Policy Schema" icon="file-code" href="/policies/policy-schema">
+    Complete YAML schema reference
+  </Card>
+  <Card title="Expressions" icon="function" href="/policies/expressions">
+    expr-lang expression syntax and helpers
+  </Card>
+  <Card title="Scanners" icon="radar" href="/policies/scanners">
+    Post-execution output scanning
+  </Card>
+  <Card title="Best Practices" icon="lightbulb" href="/policies/best-practices">
+    Patterns and anti-patterns
+  </Card>
+</CardGroup>

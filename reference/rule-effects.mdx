@@ -1,0 +1,563 @@
+---
+title: Rule Effects Reference
+description: Complete reference for PERMIT, DENY, DEFER, and SHADOW rule effects in Faramesh policies
+---
+
+## Overview
+
+Every policy rule specifies an **effect** — the action taken when the rule matches. Faramesh supports four core effects that enable fine-grained governance:
+
+- **PERMIT** — Allow the tool call to proceed
+- **DENY** — Block the tool call immediately
+- **DEFER** — Pause execution and request human approval
+- **SHADOW** — Execute read-only simulation without side effects
+
+Rules are evaluated in document order using **first-match-wins** semantics. The first rule whose conditions match determines the outcome.
+
+---
+
+## PERMIT
+
+**Allow the tool call to proceed immediately.**
+
+Use PERMIT for:
+- Safe, read-only operations
+- Pre-approved tool/argument combinations
+- Low-risk actions within established guardrails
+
+### Syntax
+
+```yaml
+effect: permit
+```
+
+Aliases: `allow`
+
+### Example: Allow Safe HTTP GET Requests
+
+```yaml
+rules:
+  - id: permit-safe-reads
+    match:
+      tool: "http/get"
+      when: "args.url.startsWith('https://api.company.com')"
+    effect: permit
+    reason: "Safe read-only API requests"
+```
+
+### Example: Permit Small Refunds
+
+```yaml
+rules:
+  - id: permit-small-refunds
+    match:
+      tool: "stripe/refund"
+      when: "args.amount <= 100"
+    effect: permit
+    reason: "Routine refunds under $100"
+```
+
+### Behavior
+
+1. Tool call proceeds immediately
+2. Result returned to agent
+3. Session history updated with `effect: "PERMIT"`
+4. Cost tracked (if `tools[].cost_usd` is set)
+5. Webhooks fired (if configured for `permit` events)
+
+---
+
+## DENY
+
+**Block the tool call immediately and return an error.**
+
+Use DENY for:
+- Prohibited operations
+- Policy violations
+- High-risk actions outside approved parameters
+- Budget/rate limit enforcement
+
+### Syntax
+
+```yaml
+effect: deny
+```
+
+Aliases: `halt`
+
+### Example: Block Destructive Shell Commands
+
+```yaml
+rules:
+  - id: deny-rm-rf
+    match:
+      tool: "shell/exec"
+      when: "args.command.contains('rm -rf')"
+    effect: deny
+    reason: "Destructive shell commands are prohibited"
+    reason_code: DESTRUCTIVE_COMMAND
+    incident_severity: critical
+```
+
+### Example: Deny External HTTP Requests
+
+```yaml
+rules:
+  - id: deny-external-http
+    match:
+      tool: "http/*"
+      when: "!args.url.startsWith('https://api.company.com')"
+    effect: deny
+    reason: "External HTTP requests not allowed"
+    reason_code: EXTERNAL_DOMAIN
+```
+
+### Behavior
+
+1. Tool call **blocked** before execution
+2. Error returned to agent with `reason` and `reason_code`
+3. Session history updated with `effect: "DENY"`
+4. Incident logged (if `incident_category` and `incident_severity` specified)
+5. Webhooks fired (if configured for `deny` events)
+
+### Error Response
+
+The agent receives a governance error:
+
+```json
+{
+  "error": "governance_denied",
+  "reason": "Destructive shell commands are prohibited",
+  "reason_code": "DESTRUCTIVE_COMMAND",
+  "rule_id": "deny-rm-rf",
+  "policy_version": "abc123"
+}
+```
+
+---
+
+## DEFER
+
+**Pause execution and request human approval before proceeding.**
+
+DEFER is Faramesh's core innovation for **human-in-the-loop governance**. When a rule triggers DEFER:
+
+1. Execution pauses
+2. Human operator receives approval request
+3. Operator reviews context and decides: approve, deny, or modify
+4. Agent resumes with operator's decision
+
+### Syntax
+
+```yaml
+effect: defer
+```
+
+Aliases: `abstain`, `pending`
+
+### Example: Defer High-Value Refunds
+
+```yaml
+rules:
+  - id: defer-high-value-refunds
+    match:
+      tool: "stripe/refund"
+      when: "args.amount > 500"
+    effect: defer
+    reason: "Refunds over $500 require human approval"
+    reason_code: HIGH_VALUE_REFUND
+    incident_category: financial_operations
+    incident_severity: high
+```
+
+### Example: Defer All Shell Execution
+
+```yaml
+rules:
+  - id: defer-shell-exec
+    match:
+      tool: "shell/*"
+    effect: defer
+    reason: "Shell commands require approval"
+    reason_code: SHELL_EXECUTION
+    incident_severity: critical
+```
+
+### Example: Defer After Suspicious Sequence
+
+```yaml
+rules:
+  - id: defer-delete-after-exfil
+    match:
+      tool: "delete_*"
+      when: "history_contains_within('http/post', 120)"
+    effect: defer
+    reason: "Delete blocked: data was sent externally in last 2 minutes"
+    reason_code: SEQUENCE_EXFIL_DETECTED
+    incident_category: data_exfiltration
+    incident_severity: high
+```
+
+### Behavior
+
+1. Tool call **paused** before execution
+2. Approval request created in DEFER queue
+3. Human operator receives notification (Slack, PagerDuty, webhook, etc.)
+4. Operator reviews:
+   - Tool ID and arguments
+   - Session context and history
+   - Policy rule that triggered
+   - Risk assessment (reversibility, blast_radius)
+5. Operator decides:
+   - **Approve** → Tool executes, agent continues
+   - **Deny** → Error returned, session continues
+   - **Modify** → Arguments adjusted, then executed
+   - **Escalate** → Forward to senior operator
+6. Agent receives decision and proceeds accordingly
+
+### DEFER Priority Tiers
+
+Configure SLA and routing for different DEFER priority levels:
+
+```yaml
+defer_priority:
+  critical:
+    criteria: "tool.blast_radius == 'external' || contains(tool.tags, 'financial')"
+    sla_seconds: 60
+    channel: "pagerduty"
+    escalation_after_seconds: 120
+    auto_deny_after_seconds: 300
+  
+  high:
+    criteria: "tool.blast_radius == 'system'"
+    sla_seconds: 300
+    channel: "slack"
+    escalation_after_seconds: 600
+  
+  normal:
+    criteria: "true"
+    sla_seconds: 1800
+    channel: "email"
+```
+
+### Webhooks
+
+DEFER events trigger webhooks with full context:
+
+```json
+{
+  "event": "defer",
+  "timestamp": "2026-03-14T10:30:00Z",
+  "agent_id": "customer-support-bot",
+  "session_id": "sess_abc123",
+  "rule_id": "defer-high-value-refunds",
+  "tool": "stripe/refund",
+  "args": {
+    "amount": 750,
+    "customer_id": "cus_xyz789"
+  },
+  "reason": "Refunds over $500 require approval",
+  "reason_code": "HIGH_VALUE_REFUND",
+  "priority": "critical",
+  "metadata": {
+    "reversibility": "irreversible",
+    "blast_radius": "external",
+    "session_cost_usd": 2.34
+  }
+}
+```
+
+---
+
+## SHADOW
+
+**Execute a read-only simulation without side effects.**
+
+SHADOW mode enables safe evaluation of policy changes and agent behavior without real-world impact. Tool calls marked `shadow_safe: true` execute normally; all others return mock data.
+
+### Syntax
+
+```yaml
+effect: shadow
+```
+
+### Example: Shadow Mode for Testing
+
+```yaml
+rules:
+  - id: shadow-new-policy
+    match:
+      tool: "*"
+      when: "session.shadow_mode == true"
+    effect: shadow
+    reason: "Testing new policy rules"
+```
+
+### Tool Safety Declaration
+
+```yaml
+tools:
+  http/get:
+    shadow_safe: true  # Safe to execute in shadow mode
+  
+  stripe/refund:
+    shadow_safe: false  # Will be mocked in shadow mode
+```
+
+### Behavior
+
+1. If `shadow_safe: true` → Tool executes normally
+2. If `shadow_safe: false` → Tool returns synthetic mock data
+3. All effects logged with `shadow: true` flag
+4. No real-world side effects (writes, API calls, etc.)
+5. Agent continues as if tools succeeded
+
+### Use Cases
+
+- **Policy Validation**: Test new rules before enforcement
+- **Dry Runs**: Simulate agent workflows without risk
+- **Compliance Audits**: Demonstrate governance without production impact
+- **Training**: Onboard operators with realistic scenarios
+
+---
+
+## First-Match-Wins Evaluation
+
+Rules are evaluated **in document order**. The first rule whose conditions match determines the effect.
+
+### Example: Order Matters
+
+```yaml
+rules:
+  # ✅ CORRECT: Specific rules first
+  - id: permit-small-refunds
+    match:
+      tool: "stripe/refund"
+      when: "args.amount <= 100"
+    effect: permit
+  
+  - id: defer-large-refunds
+    match:
+      tool: "stripe/refund"
+      when: "args.amount > 100"
+    effect: defer
+  
+  # ❌ WRONG: Catch-all before specific rules
+  # This would block the rules above from ever matching!
+  - id: deny-all-stripe
+    match:
+      tool: "stripe/*"
+    effect: deny
+```
+
+### Best Practices
+
+1. **Specific before general**: Place narrow rules before broad ones
+2. **PERMIT before DENY**: Allow known-safe cases first
+3. **High-risk patterns first**: Critical security rules at top
+4. **Default at end**: Catch-all rule as fallback
+
+---
+
+## Default Effect
+
+If **no rule matches**, the policy's `default_effect` applies.
+
+```yaml
+default_effect: deny  # Recommended: fail-closed
+```
+
+Valid values:
+- `permit` — Allow unmatched calls (fail-open)
+- `deny` — Block unmatched calls (fail-closed) ✅ **Recommended**
+- `defer` — Request approval for unmatched calls
+
+### Example: Fail-Closed Default
+
+```yaml
+rules:
+  - id: permit-http-get
+    match:
+      tool: "http/get"
+    effect: permit
+  
+  - id: defer-http-post
+    match:
+      tool: "http/post"
+    effect: defer
+
+# All other tools denied by default
+default_effect: deny
+```
+
+---
+
+## Effect Aliases
+
+For readability, Faramesh supports effect aliases:
+
+| Primary | Aliases |
+|---------|----------|
+| `permit` | `allow` |
+| `deny` | `halt` |
+| `defer` | `abstain`, `pending` |
+| `shadow` | *(no aliases)* |
+
+---
+
+## Reason Codes
+
+Every effect should include a `reason_code` for programmatic handling:
+
+```yaml
+rules:
+  - id: defer-high-value
+    match:
+      tool: "stripe/refund"
+      when: "args.amount > 1000"
+    effect: defer
+    reason: "Refund exceeds high-value threshold"
+    reason_code: HIGH_VALUE_REFUND  # Machine-readable code
+```
+
+### Default Reason Codes
+
+If `reason_code` is omitted, Faramesh assigns defaults:
+
+- `PERMIT` → `RULE_PERMIT`
+- `DENY` → `RULE_DENY`
+- `DEFER` → `RULE_DEFER`
+- `SHADOW` → `SHADOW_DENY`
+- No match → `UNMATCHED_DENY`
+
+---
+
+## Incident Tracking
+
+Attach incident metadata for monitoring and alerting:
+
+```yaml
+rules:
+  - id: deny-exfiltration-pattern
+    match:
+      tool: "delete_*"
+      when: "history_contains_within('http/post', 120)"
+    effect: deny
+    reason: "Potential data exfiltration pattern detected"
+    reason_code: EXFIL_PATTERN
+    incident_category: data_exfiltration
+    incident_severity: critical
+```
+
+<ParamField path="incident_category" type="string">
+  Category for incident classification.
+  
+  Examples: `data_exfiltration`, `financial_operations`, `credential_access`
+</ParamField>
+
+<ParamField path="incident_severity" type="string">
+  Severity level for monitoring/alerting.
+  
+  Valid values: `low`, `medium`, `high`, `critical`
+</ParamField>
+
+---
+
+## Complete Example
+
+```yaml
+faramesh-version: "1.0"
+agent-id: "production-agent"
+
+tools:
+  http/get:
+    reversibility: reversible
+    blast_radius: none
+    shadow_safe: true
+  
+  stripe/refund:
+    reversibility: irreversible
+    blast_radius: external
+    tags: [financial]
+  
+  shell/exec:
+    reversibility: irreversible
+    blast_radius: system
+
+vars:
+  max_auto_refund: 100
+
+rules:
+  # PERMIT: Safe reads
+  - id: permit-http-get
+    match:
+      tool: "http/get"
+    effect: permit
+    reason: "Safe read-only requests"
+  
+  # PERMIT: Small refunds
+  - id: permit-small-refunds
+    match:
+      tool: "stripe/refund"
+      when: "args.amount <= vars.max_auto_refund"
+    effect: permit
+    reason: "Routine small refunds"
+  
+  # DEFER: Large refunds
+  - id: defer-large-refunds
+    match:
+      tool: "stripe/refund"
+      when: "args.amount > vars.max_auto_refund"
+    effect: defer
+    reason: "High-value refund requires approval"
+    reason_code: HIGH_VALUE_REFUND
+    incident_severity: high
+  
+  # DEFER: Shell commands
+  - id: defer-shell
+    match:
+      tool: "shell/*"
+    effect: defer
+    reason: "Shell execution requires approval"
+    reason_code: SHELL_EXECUTION
+    incident_severity: critical
+  
+  # DENY: Destructive patterns
+  - id: deny-rm-rf
+    match:
+      tool: "shell/exec"
+      when: "args.command.contains('rm -rf')"
+    effect: deny
+    reason: "Destructive commands prohibited"
+    reason_code: DESTRUCTIVE_COMMAND
+    incident_category: system_safety
+    incident_severity: critical
+  
+  # Default: Deny unknown
+  - id: default-deny
+    match:
+      tool: "*"
+    effect: deny
+    reason: "No matching rule"
+
+default_effect: deny
+```
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Policy YAML" icon="file-code" href="/reference/policy-yaml">
+    Complete policy schema reference
+  </Card>
+  <Card title="Tool Metadata" icon="wrench" href="/reference/tool-metadata">
+    Understand reversibility and blast radius
+  </Card>
+  <Card title="Session State" icon="database" href="/reference/session-state">
+    History helpers and session context
+  </Card>
+  <Card title="External Selectors" icon="plug" href="/reference/selectors">
+    Custom operators and data sources
+  </Card>
+</CardGroup>

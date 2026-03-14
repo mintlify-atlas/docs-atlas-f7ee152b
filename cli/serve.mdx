@@ -1,0 +1,389 @@
+---
+title: 'faramesh serve'
+description: 'Start the Faramesh governance daemon'
+---
+
+## Overview
+
+`faramesh serve` starts the governance daemon. Agents connect via Unix socket (or gRPC/HTTP) to submit tool calls and receive PERMIT/DENY/DEFER decisions.
+
+**The daemon loads your policy, opens the audit trail, and starts accepting connections.**
+
+## Usage
+
+```bash
+faramesh serve --policy policy.yaml
+```
+
+## Required Flags
+
+<ParamField path="--policy" type="string" default="policy.yaml">
+  Path to the policy YAML file
+</ParamField>
+
+## Optional Flags
+
+<ParamField path="--data-dir" type="string">
+  Directory for WAL and DPR SQLite storage (default: `$TMPDIR/faramesh`)
+</ParamField>
+
+<ParamField path="--socket" type="string" default="/tmp/faramesh.sock">
+  Unix socket path for agent connections
+</ParamField>
+
+<ParamField path="--log-level" type="string" default="info">
+  Log level: `debug`, `info`, `warn`, `error`
+</ParamField>
+
+<ParamField path="--sync-horizon" type="boolean" default="false">
+  Stream DPR records to Faramesh Horizon cloud (requires `faramesh auth login`)
+</ParamField>
+
+<ParamField path="--slack-webhook" type="string">
+  Slack webhook URL for DEFER notifications
+</ParamField>
+
+<ParamField path="--proxy-port" type="number" default="0">
+  Start HTTP proxy adapter on this port (0 disables)
+</ParamField>
+
+<ParamField path="--grpc-port" type="number" default="0">
+  Start gRPC daemon adapter on this port (0 disables)
+</ParamField>
+
+<ParamField path="--mcp-proxy-port" type="number" default="0">
+  Start MCP HTTP gateway on this port (0 disables)
+</ParamField>
+
+<ParamField path="--mcp-target" type="string">
+  Upstream MCP HTTP server base URL (required when `--mcp-proxy-port` is set)
+</ParamField>
+
+<ParamField path="--metrics-port" type="number" default="0">
+  Start Prometheus metrics endpoint on this port (0 disables)
+</ParamField>
+
+<ParamField path="--dpr-dsn" type="string">
+  PostgreSQL DSN for mirrored DPR writes (in addition to local SQLite)
+</ParamField>
+
+## Examples
+
+### Basic Usage
+Start daemon with a policy file:
+```bash
+faramesh serve --policy policy.yaml
+```
+
+### Debug Mode
+Enable verbose logging:
+```bash
+faramesh serve --policy policy.yaml --log-level debug
+```
+
+### Slack Notifications
+Send DEFER events to Slack:
+```bash
+faramesh serve --policy policy.yaml \
+  --slack-webhook https://hooks.slack.com/services/YOUR/WEBHOOK/URL
+```
+
+### Horizon Sync
+Stream audit trail to Faramesh Horizon cloud:
+```bash
+# First, authenticate
+faramesh auth login
+
+# Then start daemon with sync enabled
+faramesh serve --policy policy.yaml --sync-horizon
+```
+
+### Custom Data Directory
+Store WAL and DPR in a specific location:
+```bash
+faramesh serve --policy policy.yaml --data-dir /var/lib/faramesh
+```
+
+### gRPC Adapter
+Enable gRPC endpoint for remote agents:
+```bash
+faramesh serve --policy policy.yaml --grpc-port 8080
+```
+
+### MCP Gateway
+Proxy an upstream MCP server with governance:
+```bash
+faramesh serve --policy policy.yaml \
+  --mcp-proxy-port 8080 \
+  --mcp-target http://localhost:3000
+```
+
+### Prometheus Metrics
+Expose metrics for monitoring:
+```bash
+faramesh serve --policy policy.yaml --metrics-port 9090
+```
+
+### PostgreSQL DPR Mirror
+Write DPR records to both SQLite and PostgreSQL:
+```bash
+faramesh serve --policy policy.yaml \
+  --dpr-dsn "postgres://user:pass@localhost/faramesh"
+```
+
+## What Happens on Startup
+
+1. **Loads policy** — Parses and compiles `policy.yaml`
+2. **Initializes storage** — Opens SQLite DPR store and WAL
+3. **Creates socket** — Unix socket at `/tmp/faramesh.sock` (or custom path)
+4. **Starts listeners** — Optional HTTP/gRPC/MCP/metrics endpoints
+5. **Ready** — Logs "Faramesh daemon ready" and begins accepting connections
+
+## Daemon Lifecycle
+
+### Starting
+```bash
+$ faramesh serve --policy policy.yaml
+{"level":"info","msg":"policy loaded","version":"1.0","rules":5}
+{"level":"info","msg":"DPR store opened","path":"/tmp/faramesh/dpr.db"}
+{"level":"info","msg":"socket listener started","path":"/tmp/faramesh.sock"}
+{"level":"info","msg":"Faramesh daemon ready"}
+```
+
+### Hot-Reloading Policy
+Reload policy without restarting:
+```bash
+# In another terminal
+faramesh policy reload
+
+# Daemon logs:
+{"level":"info","msg":"received SIGHUP, reloading policy"}
+{"level":"info","msg":"policy reloaded","version":"1.1","rules":6}
+```
+
+### Graceful Shutdown
+Stop with Ctrl+C or SIGTERM:
+```bash
+^C
+{"level":"info","msg":"received SIGTERM, shutting down"}
+{"level":"info","msg":"closing DPR store"}
+{"level":"info","msg":"daemon stopped"}
+```
+
+## Storage Locations
+
+### Default Data Directory
+```
+$TMPDIR/faramesh/
+  ├── dpr.db              # SQLite audit trail
+  ├── wal/                # Write-ahead log
+  └── faramesh.pid        # Daemon PID file
+```
+
+### Custom Data Directory
+```bash
+faramesh serve --policy policy.yaml --data-dir /var/lib/faramesh
+```
+
+Results in:
+```
+/var/lib/faramesh/
+  ├── dpr.db
+  ├── wal/
+  └── faramesh.pid
+```
+
+## Horizon Cloud Sync
+
+To stream DPR records to Faramesh Horizon:
+
+### 1. Authenticate
+```bash
+faramesh auth login
+```
+
+### 2. Start Daemon with Sync
+```bash
+faramesh serve --policy policy.yaml --sync-horizon
+```
+
+### 3. Verify Sync
+Check daemon logs:
+```json
+{"level":"info","msg":"horizon sync enabled","org":"Acme Corp","user":"you@acme.com"}
+{"level":"info","msg":"DPR record synced to Horizon","record_id":"rec_abc123"}
+```
+
+## Slack Integration
+
+Send DEFER notifications to Slack:
+
+### 1. Create Webhook
+1. Go to https://api.slack.com/apps
+2. Create an app → Incoming Webhooks
+3. Copy webhook URL
+
+### 2. Start Daemon
+```bash
+faramesh serve --policy policy.yaml \
+  --slack-webhook https://hooks.slack.com/services/YOUR/WEBHOOK/URL
+```
+
+### 3. Receive Notifications
+When a DEFER decision occurs:
+```text
+🚨 Agent Action Requires Approval
+
+Agent: payment-bot
+Tool: stripe/refund
+Amount: $12,000
+Reason: high-value operation requires human approval
+
+Approve: faramesh agent approve <token>
+Deny: faramesh agent deny <token>
+```
+
+## Monitoring
+
+### Prometheus Metrics
+Enable metrics endpoint:
+```bash
+faramesh serve --policy policy.yaml --metrics-port 9090
+```
+
+Available metrics:
+- `faramesh_decisions_total{effect}` — Counter of decisions by effect
+- `faramesh_decision_latency_seconds` — Histogram of decision latencies
+- `faramesh_policy_reloads_total` — Counter of policy reloads
+- `faramesh_dpr_records_total` — Counter of DPR records written
+
+Scrape config:
+```yaml
+scrape_configs:
+  - job_name: 'faramesh'
+    static_configs:
+      - targets: ['localhost:9090']
+```
+
+### Structured Logging
+JSON logs for ingestion by log aggregators:
+```json
+{"level":"info","ts":"2024-03-14T15:04:05Z","msg":"decision","effect":"PERMIT","tool":"stripe/charge","agent":"payment-bot","latency_ms":1}
+{"level":"warn","ts":"2024-03-14T15:04:06Z","msg":"decision","effect":"DENY","tool":"shell/run","agent":"dev-agent","reason":"DESTRUCTIVE_SHELL_COMMAND"}
+```
+
+## Production Deployment
+
+### Systemd Service
+```ini
+[Unit]
+Description=Faramesh Governance Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=faramesh
+Group=faramesh
+ExecStart=/usr/local/bin/faramesh serve --policy /etc/faramesh/policy.yaml --data-dir /var/lib/faramesh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+```bash
+sudo systemctl enable faramesh
+sudo systemctl start faramesh
+sudo systemctl status faramesh
+```
+
+### Docker
+```dockerfile
+FROM alpine:latest
+RUN apk add --no-cache ca-certificates
+COPY faramesh /usr/local/bin/
+COPY policy.yaml /etc/faramesh/
+CMD ["faramesh", "serve", "--policy", "/etc/faramesh/policy.yaml"]
+```
+
+Run:
+```bash
+docker run -v $(pwd)/policy.yaml:/etc/faramesh/policy.yaml \
+  -v /var/lib/faramesh:/var/lib/faramesh \
+  faramesh:latest
+```
+
+### Kubernetes
+See [Kubernetes Deployment](/guides/kubernetes) for full Helm chart.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Error: policy file not found">
+    Ensure the policy file exists:
+    ```bash
+    ls -la policy.yaml
+    faramesh policy validate policy.yaml
+    faramesh serve --policy policy.yaml
+    ```
+  </Accordion>
+  
+  <Accordion title="Error: address already in use">
+    Another daemon is running or socket wasn't cleaned up:
+    ```bash
+    # Check for running daemon
+    ps aux | grep faramesh
+    
+    # Remove stale socket
+    rm /tmp/faramesh.sock
+    
+    # Or use a different socket path
+    faramesh serve --policy policy.yaml --socket /tmp/faramesh2.sock
+    ```
+  </Accordion>
+  
+  <Accordion title="Horizon sync fails">
+    Verify authentication:
+    ```bash
+    faramesh auth status
+    
+    # Re-authenticate if expired
+    faramesh auth login
+    ```
+  </Accordion>
+  
+  <Accordion title="Want to run daemon in background">
+    Use `&` or `nohup`:
+    ```bash
+    # Background
+    faramesh serve --policy policy.yaml &
+    
+    # With nohup (survives terminal close)
+    nohup faramesh serve --policy policy.yaml > faramesh.log 2>&1 &
+    
+    # Or use systemd (recommended for production)
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Stream Live Decisions" icon="activity" href="/cli/audit">
+    Use `faramesh audit tail` to watch decisions
+  </Card>
+  
+  <Card title="Hot-Reload Policy" icon="rotate" href="/cli/policy">
+    Update policy without restarting daemon
+  </Card>
+  
+  <Card title="Monitor with Prometheus" icon="chart-line" href="/deployment/monitoring">
+    Set up metrics and alerting
+  </Card>
+  
+  <Card title="Authenticate with Horizon" icon="cloud" href="/cli/auth">
+    Enable cloud sync and fleet management
+  </Card>
+</CardGroup>

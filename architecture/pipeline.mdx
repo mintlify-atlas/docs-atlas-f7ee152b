@@ -1,0 +1,400 @@
+---
+title: 'Governance Pipeline'
+description: 'WAL-first 11-step decision pipeline architecture'
+---
+
+## Overview
+
+The governance pipeline is the invariant core of Faramesh. Every tool call flows through the same 11-step evaluation process, regardless of which adapter delivered the request. The pipeline enforces the **WAL ordering invariant**: no decision is returned until a durable audit record exists on disk.
+
+## Architecture Principle
+
+```
+CanonicalActionRequest → [11-Step Pipeline] → Decision + WAL Record
+```
+
+The pipeline accepts a `CanonicalActionRequest` (CAR) and returns a `Decision`. The adapter's only job is to translate its environment into a CAR and act on the Decision. This keeps the core evaluation logic identical across all deployment modes.
+
+## Pipeline Implementation
+
+```go title="internal/core/pipeline.go"
+type Pipeline struct {
+    engine      *policy.AtomicEngine
+    wal         dpr.Writer
+    store       dpr.StoreBackend      // SQLite/PostgreSQL
+    sessions    *session.Manager
+    defers      *deferwork.Workflow
+    chainMu     map[string]string     // agentID → last record hash
+    chainLock   sync.Mutex
+    syncer      DecisionSyncer        // optional Horizon cloud sync
+    postScanner *postcondition.Scanner
+    httpClient  *http.Client
+}
+```
+
+## The 11-Step Pipeline
+
+Every governance decision flows through these steps in order:
+
+### Step 0: Canonicalization
+
+**Purpose**: Normalize input to prevent Unicode-based policy bypass attacks.
+
+```go
+// NFKC normalization, confusable mapping, null stripping,
+// float rounding, string trimming
+req.Args = canonicalize.Args(req.Args)
+req.ToolID = canonicalize.ToolID(req.ToolID)
+```
+
+**Protection**: Prevents attacks using Unicode confusables (e.g., Cyrillic "а" vs Latin "a"), homoglyphs, zero-width characters, and path traversal sequences.
+
+---
+
+### Step 1: Kill Switch Check
+
+**Latency**: Nanoseconds (atomic boolean read)
+
+```go
+sess := p.sessions.Get(req.AgentID)
+if sess.IsKilled() {
+    return Decision{Effect: EffectDeny, ReasonCode: reasons.KillSwitchActive}
+}
+```
+
+The kill switch is an emergency brake: when activated for an agent, all subsequent calls are denied instantly. No network, no computation.
+
+---
+
+### Step 2: Phase Check
+
+**Purpose**: Verify tool visibility within the current workflow phase.
+
+Future enhancement: restrict which tools are callable during planning vs execution vs observation phases.
+
+---
+
+### Step 3: Pre-Execution Scanners
+
+**Latency**: ~0.1ms (parallel regex patterns)
+
+Six parallel scanners detect dangerous patterns in tool arguments:
+
+| Scanner | Pattern | Example |
+|---------|---------|----------|
+| **Destructive Shell** | `rm -rf`, `mkfs`, `dd if=`, fork bombs | `rm -rf /` |
+| **Secret Leakage** | AWS keys, API tokens, passwords | `AKIA1234567890ABCDEF` |
+| **Path Traversal** | `../`, URL-encoded traversal | `../../etc/passwd` |
+| **SQL Injection** | `' OR 1=1`, `DROP TABLE`, `UNION SELECT` | `'; DROP TABLE users--` |
+| **Code Execution** | `eval()`, `exec()`, `__import__` | `eval(input())` |
+| **Sensitive Paths** | `.env`, `id_rsa`, `/etc/passwd`, `.pem` | `.env` |
+
+```go
+if denied, code, reason := runScanners(req); denied {
+    return Decision{Effect: EffectDeny, ReasonCode: code, Reason: reason}
+}
+```
+
+**Critical**: These scanners run **before policy evaluation** and cannot be disabled by policy. They are the security floor.
+
+---
+
+### Step 3.1: Delegation Scope Check
+
+**Purpose**: Ensure delegated calls stay within authorized scope.
+
+```go
+if req.Delegation != nil && req.Delegation.Len() > 0 {
+    if !req.Delegation.ToolInScope(req.ToolID) {
+        return Decision{Effect: EffectDeny, ReasonCode: reasons.DelegationExceedsAuthority}
+    }
+}
+```
+
+Prevents sub-agents from calling tools outside their delegation grant.
+
+---
+
+### Step 3.2: Context Guard Check
+
+**Purpose**: Verify external context freshness (API health, service availability).
+
+```go
+if len(doc.ContextGuards) > 0 {
+    guardResult := contextguard.Check(doc.ContextGuards, p.httpClient)
+    if !guardResult.Passed {
+        return Decision{Effect: guardResult.Effect, ReasonCode: guardResult.ReasonCode}
+    }
+}
+```
+
+Example: deny all payment refunds if Stripe's status API reports an outage.
+
+---
+
+### Step 4: Session State Read
+
+**Latency**: &lt;1μs (atomic increment)
+
+```go
+callCount := sess.IncrCallCount()
+```
+
+Atomically increment the call counter for this agent's session. Used for rate limits and history window calculations.
+
+---
+
+### Step 5: Budget Enforcement
+
+**Purpose**: Enforce session and daily cost/call limits.
+
+```go
+if doc.Budget != nil {
+    if denied, code, reason := p.checkBudget(req.AgentID, doc.Budget, callCount); denied {
+        return Decision{Effect: EffectDeny, ReasonCode: code, Reason: reason}
+    }
+}
+```
+
+**Supported Limits**:
+- `max_calls`: Total calls per session
+- `session_usd`: Total cost per session (when tools declare `cost_usd`)
+- `daily_usd`: Total cost per UTC calendar day
+
+---
+
+### Step 6: History Ring Buffer Read
+
+**Purpose**: Load recent tool calls for sequence/pattern detection.
+
+```go
+history := sess.History()
+```
+
+The session maintains a fixed-size ring buffer of recent tool calls. Policy rules can reference:
+- `history_contains_within("http/post", 120)` — did any HTTP POST occur in the last 2 minutes?
+- `history_sequence("read_file", "shell/exec", "http/post")` — detect data exfiltration patterns
+- `deny_count_within(60)` — escalate response if multiple denies occurred recently
+
+---
+
+### Step 7: Tool Metadata Lookup
+
+**Purpose**: Populate the `tool.*` condition surface for policy rules.
+
+```go
+toolMeta := policy.ToolCtx{}
+if t, ok := doc.Tools[req.ToolID]; ok {
+    toolMeta = policy.ToolCtx{
+        Reversibility: t.Reversibility,  // "irreversible" | "reversible" | "compensatable"
+        BlastRadius:   t.BlastRadius,    // "none" | "local" | "scoped" | "system" | "external"
+        Tags:          t.Tags,
+        CostUSD:       t.CostUSD,
+    }
+}
+```
+
+Policy rules can reference:
+- `tool.reversibility == "irreversible"` → require approval for irreversible actions
+- `tool.blast_radius == "external"` → defer actions with external impact
+
+---
+
+### Step 8: Policy Evaluation
+
+**Latency**: ~1μs per rule (compiled bytecode execution)
+
+```go
+result := p.engine.Get().Evaluate(req.ToolID, ctx)
+```
+
+**Algorithm**: First-match-wins. Rules are evaluated in order. The first rule where:
+1. `match.tool` pattern matches the tool ID (supports globs: `stripe/*`)
+2. `match.when` expression evaluates to `true`
+
+...determines the decision. If no rule matches, the policy's `default_effect` is applied.
+
+**Expression Language**: [expr-lang](https://github.com/expr-lang/expr) — Go-native, type-safe, sandboxed.
+
+**Available Context**:
+
+```yaml
+# Policy rule example showing all available context
+rules:
+  - id: example-rule
+    match:
+      tool: stripe/refund
+      when: |
+        args["amount"] > vars["max_refund"] &&
+        session.call_count < 100 &&
+        tool.reversibility == "irreversible" &&
+        principal.tier == "free" &&
+        delegation.depth == 0 &&
+        time.hour >= 9 && time.hour <= 17
+    effect: defer
+```
+
+---
+
+### Step 9: WAL Write (Critical Invariant)
+
+**Purpose**: Durably record the decision **before** returning it.
+
+```go
+rec := p.buildRecord(req, d)
+if err := p.wal.Write(rec); err != nil {
+    // If WAL write fails, we DENY to preserve the invariant
+    return Decision{
+        Effect:     EffectDeny,
+        ReasonCode: reasons.WALWriteFailure,
+        Reason:     "audit record write failed; denying to preserve WAL invariant",
+    }
+}
+```
+
+**Invariant**: Execution must never precede the audit record. Under any failure mode, no decision is returned until a durable WAL entry exists.
+
+**Implementation**: The WAL is a newline-delimited JSON file with `fsync()` after every write.
+
+---
+
+### Step 10: Async Replication
+
+**Purpose**: Update SQLite DPR store, session state, and Horizon sync (if enabled).
+
+```go
+// Async: replicate to SQLite
+if p.store != nil {
+    go func() { _ = p.store.Save(rec) }()
+}
+
+// Sync: update history (must be deterministic for next call)
+sess.RecordHistory(req.ToolID, string(d.Effect))
+
+// Async: account cost
+if d.Effect == EffectPermit || d.Effect == EffectShadow {
+    go p.accountCost(req.AgentID, req.ToolID, sess)
+}
+
+// Async: sync to Horizon cloud (if configured)
+if p.syncer != nil {
+    go p.syncer.Send(d)
+}
+```
+
+**Critical**: History updates are **synchronous** so the next `Evaluate()` call sees the latest decision. Cost accounting and cloud sync are async.
+
+---
+
+### Step 11: Return Decision
+
+```go
+return Decision{
+    Effect:        EffectPermit,
+    RuleID:        "allow-read-customer",
+    ReasonCode:    "RULE_PERMIT",
+    PolicyVersion: "sha256:abc123...",
+    Latency:       11 * time.Millisecond,
+}
+```
+
+The adapter receives the decision and:
+- **PERMIT**: execute the tool and return the result
+- **DENY**: raise an error with the `denial_token`
+- **DEFER**: park the caller and poll for approval
+- **SHADOW**: execute the tool but log what the policy *would* have done in enforcement mode
+
+---
+
+## Decision Types
+
+```go title="internal/core/types.go"
+type Effect string
+
+const (
+    EffectPermit       Effect = "PERMIT"   // Execute the tool
+    EffectDeny         Effect = "DENY"     // Block the tool
+    EffectDefer        Effect = "DEFER"    // Park pending human approval
+    EffectShadow       Effect = "SHADOW"   // Log decision without enforcement
+)
+```
+
+| Effect | Behavior | Use Case |
+|--------|----------|----------|
+| **PERMIT** | Execute tool immediately | Normal operation |
+| **DENY** | Block execution, return error | Policy violation, security scanner match |
+| **DEFER** | Park caller until approval | High-value operations requiring human judgment |
+| **SHADOW** | Execute but log counterfactual | Policy testing, pre-deployment validation |
+
+---
+
+## Canonical Action Request
+
+```go title="internal/core/types.go"
+type CanonicalActionRequest struct {
+    CallID           string            // UUID v4 for idempotency
+    AgentID          string            // Agent identity
+    SessionID        string            // Session grouping
+    ToolID           string            // Tool identifier (e.g., "stripe/refund")
+    Args             map[string]any    // Tool arguments
+    Timestamp        time.Time         // When adapter received the call
+    InterceptAdapter string            // "sdk" | "daemon" | "proxy" | "mcp" | "ebpf"
+    Principal        *principal.Identity       // Optional: human/system invoker
+    Delegation       *principal.DelegationChain // Optional: delegation chain
+}
+```
+
+The CAR is the normalized input format. Every adapter translates its environment into this structure before submitting to the pipeline.
+
+---
+
+## Performance Profile
+
+Typical latencies (measured on a 2023 MacBook Pro M2):
+
+| Step | Latency |
+|------|----------|
+| 0. Canonicalization | 2μs |
+| 1. Kill switch | 10ns (atomic read) |
+| 2. Phase check | — |
+| 3. Pre-execution scanners | 80μs (6 parallel regexes) |
+| 3.1 Delegation scope | 50ns |
+| 3.2 Context guards | 5ms (if HTTP check required) |
+| 4. Session state read | 100ns |
+| 5. Budget enforcement | 200ns |
+| 6. History ring read | 500ns |
+| 7. Tool metadata lookup | 50ns |
+| 8. Policy evaluation | 1μs per rule |
+| 9. **WAL write** | **3-8ms** (fsync) |
+| 10. Async replication | (async) |
+| 11. Return | — |
+| **Total** | **11ms** (p50) |
+
+The WAL fsync dominates latency. Without fsync (unsafe mode), the pipeline completes in &lt;100μs.
+
+---
+
+## Error Handling
+
+**Fail-Closed Policy**: If the governance layer itself fails, actions are DENIED.
+
+| Failure Mode | Behavior |
+|--------------|----------|
+| WAL write fails | DENY with `WAL_WRITE_FAILURE` |
+| Policy compilation error | DENY with `POLICY_INVALID` |
+| Session backend unavailable | Degrade to stateless mode (no history/budget) |
+| DPR store unavailable | Continue (WAL is source of truth) |
+| Horizon sync fails | Log warning, continue |
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Core Modules" icon="cube" href="/architecture/core-modules">
+    Deep dive into defer/, dpr/, policy/, session/ modules
+  </Card>
+  <Card title="Storage Backends" icon="database" href="/architecture/storage">
+    SQLite, PostgreSQL, Redis configuration
+  </Card>
+</CardGroup>

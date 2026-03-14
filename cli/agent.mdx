@@ -1,0 +1,455 @@
+---
+title: 'faramesh agent'
+description: 'Fleet management: approve/deny pending actions and activate kill switches'
+---
+
+## Overview
+
+The `faramesh agent` command group provides fleet management capabilities for governing agents at runtime.
+
+## Commands
+
+- **`approve`** — Approve a pending DEFER action
+- **`deny`** — Deny a pending DEFER action
+- **`kill`** — Activate kill switch for an agent (all subsequent calls will DENY)
+
+---
+
+## faramesh agent approve
+
+Approve a pending DEFER action.
+
+### Usage
+```bash
+faramesh agent approve <defer-token>
+```
+
+### Flags
+
+<ParamField path="--socket" type="string" default="/tmp/faramesh.sock">
+  Daemon Unix socket path
+</ParamField>
+
+### What It Does
+1. Connects to running daemon
+2. Sends approval for the DEFER token
+3. Agent receives PERMIT response
+4. Action proceeds
+
+### Example
+
+```bash
+# Agent hits a DEFER rule
+# Daemon logs: DEFER token: defer_abc123
+# Or Slack notification includes token
+
+# Human approves
+$ faramesh agent approve defer_abc123
+✓ DEFER token defer_abc123 approved
+```
+
+### Workflow
+
+1. **Agent makes tool call** that matches DEFER rule
+2. **Daemon sends notification** (Slack, log, etc.) with `defer_token`
+3. **Human reviews** the proposed action
+4. **Human approves** via CLI:
+   ```bash
+   faramesh agent approve <defer-token>
+   ```
+5. **Agent receives PERMIT** and proceeds
+
+---
+
+## faramesh agent deny
+
+Deny a pending DEFER action.
+
+### Usage
+```bash
+faramesh agent deny <defer-token>
+```
+
+### Flags
+
+<ParamField path="--socket" type="string" default="/tmp/faramesh.sock">
+  Daemon Unix socket path
+</ParamField>
+
+### What It Does
+1. Connects to running daemon
+2. Sends denial for the DEFER token
+3. Agent receives DENY response
+4. Action is blocked
+
+### Example
+
+```bash
+# Human denies
+$ faramesh agent deny defer_abc123
+✓ DEFER token defer_abc123 denied
+```
+
+### Workflow
+
+1. **Agent makes tool call** that matches DEFER rule
+2. **Human reviews** the proposed action
+3. **Human denies** via CLI:
+   ```bash
+   faramesh agent deny <defer-token>
+   ```
+4. **Agent receives DENY** and action is blocked
+
+---
+
+## faramesh agent kill
+
+Activate kill switch for an agent — all subsequent calls will DENY.
+
+### Usage
+```bash
+faramesh agent kill <agent-id>
+```
+
+### Flags
+
+<ParamField path="--socket" type="string" default="/tmp/faramesh.sock">
+  Daemon Unix socket path
+</ParamField>
+
+### What It Does
+1. Connects to running daemon
+2. Activates kill switch for the specified agent
+3. **All subsequent tool calls from this agent will be DENIED**
+4. Effect persists until daemon restart
+
+### Example
+
+```bash
+$ faramesh agent kill payment-bot
+⚡ Kill switch activated for agent: payment-bot
+All subsequent calls from this agent will be DENIED.
+```
+
+### Use Cases
+
+#### Emergency Stop
+Agent is behaving unexpectedly:
+```bash
+faramesh agent kill rogue-agent
+```
+
+#### Incident Response
+Suspicious activity detected:
+```bash
+# Kill the agent
+faramesh agent kill compromised-agent
+
+# Investigate
+faramesh audit export dpr.db --agent compromised-agent --format json
+```
+
+#### Maintenance
+Disable agent during system maintenance:
+```bash
+faramesh agent kill maintenance-agent
+# ... perform maintenance ...
+# Restart daemon to re-enable
+```
+
+---
+
+## DEFER Workflow
+
+### Full Example: High-Value Refund
+
+#### 1. Policy
+```yaml
+rules:
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 500'
+    effect: defer
+    reason: high-value refund requires approval
+    reason_code: HIGH_VALUE_THRESHOLD
+```
+
+#### 2. Daemon with Slack Notifications
+```bash
+faramesh serve --policy policy.yaml \
+  --slack-webhook https://hooks.slack.com/services/YOUR/WEBHOOK
+```
+
+#### 3. Agent Makes Tool Call
+```python
+# Agent code
+result = stripe.refund(amount=5000)
+# ... agent waits for approval ...
+```
+
+#### 4. Slack Notification
+```text
+🚨 Agent Action Requires Approval
+
+Agent: payment-bot
+Tool: stripe/refund
+Amount: $5,000
+Reason: high-value refund requires approval
+
+Approve: faramesh agent approve defer_abc123
+Deny: faramesh agent deny defer_abc123
+```
+
+#### 5. Human Reviews and Approves
+```bash
+$ faramesh agent approve defer_abc123
+✓ DEFER token defer_abc123 approved
+```
+
+#### 6. Agent Proceeds
+```python
+# Agent receives PERMIT and continues
+result = stripe.refund(amount=5000)  # ✓ Approved
+print(f"Refund successful: {result.id}")
+```
+
+---
+
+## Slack Integration
+
+### Setup
+
+1. **Create Slack Webhook**
+   - Go to https://api.slack.com/apps
+   - Create app → Incoming Webhooks
+   - Copy webhook URL
+
+2. **Start Daemon with Webhook**
+   ```bash
+   faramesh serve --policy policy.yaml \
+     --slack-webhook https://hooks.slack.com/services/YOUR/WEBHOOK
+   ```
+
+3. **Receive Notifications**
+   When a DEFER decision occurs, Slack receives:
+   ```text
+   🚨 Agent Action Requires Approval
+   
+   Agent: payment-bot
+   Tool: stripe/refund
+   Amount: $12,000
+   Reason: high-value operation requires human approval
+   
+   Approve: faramesh agent approve defer_abc123
+   Deny: faramesh agent deny defer_abc123
+   ```
+
+4. **Approve/Deny from CLI**
+   ```bash
+   faramesh agent approve defer_abc123
+   # or
+   faramesh agent deny defer_abc123
+   ```
+
+---
+
+## DEFER Token Format
+
+DEFER tokens are generated by the daemon:
+
+```
+defer_<random-id>
+```
+
+Example: `defer_7f8a3c2b1e9d`
+
+### Token Lifecycle
+
+1. **Generated** when DEFER rule matches
+2. **Sent** to agent (who is waiting)
+3. **Included** in Slack/log notification
+4. **Used** by human to approve/deny
+5. **Resolved** to PERMIT or DENY
+6. **Expired** after timeout (configurable)
+
+---
+
+## Kill Switch Behavior
+
+Once activated:
+
+### What Happens
+- ✅ All tool calls from the agent are **immediately DENIED**
+- ✅ Decisions are logged with `reason_code: KILL_SWITCH_ACTIVE`
+- ✅ Agent can still make calls (they're just all denied)
+- ✅ Kill switch persists until daemon restart
+
+### What Doesn't Happen
+- ❌ In-flight calls are **not** interrupted
+- ❌ Agent process is **not** terminated
+- ❌ Other agents are **not** affected
+
+### Deactivation
+
+Kill switches persist until daemon restart:
+
+```bash
+# Restart daemon to deactivate kill switch
+kill -TERM <daemon-pid>
+faramesh serve --policy policy.yaml
+```
+
+Or implement custom logic to track/deactivate kill switches in your policy.
+
+---
+
+## Remote Management
+
+For production deployments, combine with SSH or Kubernetes:
+
+### SSH
+```bash
+# Approve on remote server
+ssh prod-server "faramesh agent approve defer_abc123"
+```
+
+### Kubernetes
+```bash
+# Find daemon pod
+kubectl get pods -l app=faramesh-daemon
+
+# Approve via exec
+kubectl exec faramesh-daemon-xyz -- \
+  faramesh agent approve defer_abc123 --socket /var/run/faramesh.sock
+```
+
+### API (Future)
+HTTP API for approvals coming soon:
+```bash
+curl -X POST https://faramesh.example.com/api/defer/approve \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"token": "defer_abc123"}'
+```
+
+---
+
+## Use Cases
+
+### 1. High-Value Operations
+```yaml
+rules:
+  - id: defer-large-payments
+    match:
+      tool: stripe/*
+      when: 'args["amount"] > 10000'
+    effect: defer
+```
+
+Human approves:
+```bash
+faramesh agent approve defer_xyz789
+```
+
+### 2. Destructive Operations
+```yaml
+rules:
+  - id: defer-db-deletes
+    match:
+      tool: db/delete
+    effect: defer
+```
+
+Human reviews and denies:
+```bash
+faramesh agent deny defer_abc123
+```
+
+### 3. Emergency Stop
+Agent goes rogue:
+```bash
+faramesh agent kill rogue-agent
+```
+
+### 4. Rate Limiting Bypass
+```yaml
+rules:
+  - id: defer-rate-limit-override
+    match:
+      tool: api/call
+      when: 'session.rate_limit_exceeded'
+    effect: defer
+```
+
+Human approves one-time bypass:
+```bash
+faramesh agent approve defer_override123
+```
+
+---
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Error: daemon not running">
+    Ensure daemon is running:
+    ```bash
+    # Check if daemon is running
+    ps aux | grep faramesh
+    
+    # Start daemon if needed
+    faramesh serve --policy policy.yaml
+    ```
+  </Accordion>
+  
+  <Accordion title="Error: invalid token">
+    The DEFER token may have expired or already been resolved:
+    ```bash
+    # Check daemon logs for recent DEFER decisions
+    faramesh audit tail
+    ```
+  </Accordion>
+  
+  <Accordion title="Want to approve via Slack">
+    Slack slash commands coming soon. For now, copy the command from Slack and run in terminal:
+    ```bash
+    faramesh agent approve defer_abc123
+    ```
+  </Accordion>
+  
+  <Accordion title="How to undo kill switch?">
+    Restart the daemon:
+    ```bash
+    # Find daemon process
+    ps aux | grep "faramesh serve"
+    
+    # Kill gracefully
+    kill -TERM <pid>
+    
+    # Restart
+    faramesh serve --policy policy.yaml
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Write DEFER Rules" icon="pause" href="/reference/rule-effects">
+    Learn how to write DEFER rules in your policy
+  </Card>
+  
+  <Card title="Slack Integration" icon="slack" href="/cli/agent">
+    Set up Slack notifications for DEFER events
+  </Card>
+  
+  <Card title="Audit Trail" icon="list" href="/cli/audit">
+    Track all approve/deny/kill actions in DPR
+  </Card>
+  
+  <Card title="Production Deployment" icon="rocket" href="/deployment/daemon">
+    Deploy fleet management in production
+  </Card>
+</CardGroup>

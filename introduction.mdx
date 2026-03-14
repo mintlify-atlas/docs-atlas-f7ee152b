@@ -1,0 +1,230 @@
+---
+title: Introduction to Faramesh
+description: Unified governance plane for AI agents with pre-execution authorization, policy-as-code, and tamper-evident audit trails
+---
+
+## What is Faramesh?
+
+Faramesh is a **unified governance plane for AI agents** that provides pre-execution authorization, policy-as-code, and tamper-evident audit trails. It acts as a control layer between your AI agents and the actions they want to perform, enabling you to enforce policies before actions execute.
+
+<CardGroup cols={3}>
+  <Card title="Pre-execution Authorization" icon="shield-check">
+    Every agent action is evaluated against your policies **before** it executes — not after
+  </Card>
+  <Card title="Policy-as-Code" icon="file-code">
+    Write governance rules in YAML with type-safe expressions that compile to bytecode
+  </Card>
+  <Card title="Tamper-Evident Audit" icon="link">
+    Every decision is recorded in a cryptographic chain with SHA256 integrity verification
+  </Card>
+</CardGroup>
+
+## Why Faramesh?
+
+As AI agents become more autonomous and capable, they need governance guardrails. Faramesh solves critical problems that emerge when agents interact with real systems:
+
+### The Core Problems
+
+<AccordionGroup>
+  <Accordion title="Problem 1: No execution control before disaster strikes">
+    **Without governance:** An agent decides to run `rm -rf /` or send emails to 10,000 customers — and you only find out after it happens.
+
+    **With Faramesh:** The destructive command is blocked **before execution**. The policy engine evaluates every action in microseconds and returns PERMIT, DENY, or DEFER.
+
+    ```yaml
+    rules:
+      - id: deny-destructive-shell
+        match:
+          tool: shell/run
+          when: 'args["cmd"] matches "rm\\s+-[rf]"'
+        effect: deny
+        reason: destructive shell command blocked by policy
+    ```
+  </Accordion>
+
+  <Accordion title="Problem 2: High-value actions need human oversight">
+    **Without governance:** An agent refunds $12,000 without approval because the LLM decided it was the right thing to do.
+
+    **With Faramesh:** High-value operations are **deferred** pending human approval. The agent waits, you approve or deny via CLI, and the agent continues.
+
+    ```yaml
+    rules:
+      - id: defer-high-value-refund
+        match:
+          tool: stripe/refund
+          when: 'args["amount"] > 500'
+        effect: defer
+        reason: refund exceeds threshold — requires finance approval
+    ```
+
+    ```bash
+    # Agent blocks, you receive notification
+    faramesh agent approve abc12345  # Unblocks the agent
+    ```
+  </Accordion>
+
+  <Accordion title="Problem 3: No audit trail for agent decisions">
+    **Without governance:** An agent makes thousands of decisions. You have logs, but no cryptographic proof of what was authorized and when.
+
+    **With Faramesh:** Every decision is recorded in a **DPR (Decision-Provenance Record) chain** — a tamper-evident audit trail where each record includes:
+    - SHA256 hash of the current record
+    - SHA256 hash of the previous record (linked list)
+    - Policy version active at decision time
+    - Effect (PERMIT/DENY/DEFER/SHADOW)
+
+    ```bash
+    faramesh audit verify ~/.faramesh/faramesh.db
+    # ✓ Chain integrity verified. 1,247 records, 0 violations.
+    ```
+  </Accordion>
+
+  <Accordion title="Problem 4: Governance shouldn't require infrastructure rewrites">
+    **Without Faramesh:** You'd need to rewrite your agent code, add middleware, deploy services, configure networks.
+
+    **With Faramesh:** Zero infrastructure in development. One decorator. Auto-starting daemon.
+
+    ```python
+    from faramesh import govern
+
+    governed_refund = govern(stripe_refund, policy='payment.yaml', agent_id='payment-bot')
+    # That's it. First call auto-starts the daemon.
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## How It Works
+
+Faramesh uses a **WAL-first governance pipeline** that guarantees every decision is durably recorded before being returned to the agent:
+
+```
+Agent calls governed_refund(amount=12000)
+  ↓
+[1] Faramesh intercepts the call (via SDK shim, daemon, or sidecar)
+  ↓
+[2] Canonical Action Request is created
+  ↓
+[3] Pipeline evaluates:
+    • Kill switch check (atomic, nanoseconds)
+    • Pre-execution scanners (shell, secret, PII — parallel)
+    • Policy rules (expr-lang bytecode, ~1μs per rule)
+  ↓
+[4] Decision: PERMIT | DENY | DEFER | SHADOW
+  ↓
+[5] WAL write — fsync to disk BEFORE returning
+  ↓
+[6] Decision returned to agent
+  ↓
+[7] Async: replicate to SQLite DPR chain, update session state
+```
+
+<Note>
+  **The WAL ordering invariant:** No execution without an audit record — under any failure mode. If the WAL write fails, the decision is DENY.
+</Note>
+
+## The Faramesh Ecosystem
+
+Faramesh is a suite of standalone tools that work together as a unified governance plane. Each tool is fully functional on its own:
+
+| Tool | Purpose |
+|------|---------||
+| **Core** | Pre-execution policy engine, DPR audit chain, DEFER workflow |
+| **Tesseract** | Pre-governance observation — see what agents do before writing policies |
+| **Hub** | Open-source policy pack registry with community packs |
+| **Sverm** | Cross-agent behavioral analysis and swarm governance |
+| **CostShield** | Pre-execution cost governance — prevent runaway LLM/API spend |
+| **Supply Chain** | Cryptographic signing, SBOM, reproducible build verification |
+
+All tools connect via the **Mesh** protocol — when multiple tools run on the same machine, they discover each other automatically and exchange data through authenticated Unix domain sockets.
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Three Decision Types" icon="check-double">
+    **PERMIT** — Allow the action immediately  
+    **DENY** — Block the action with a reason code  
+    **DEFER** — Park the request, wait for human approval
+  </Card>
+
+  <Card title="Zero Infrastructure (Dev Mode)" icon="rocket">
+    `govern()` auto-starts the daemon on first call. No separate setup in development.
+  </Card>
+
+  <Card title="Policy Validation in CI" icon="vial">
+    ```bash
+    faramesh policy validate payment.yaml
+    ```
+    Parses YAML, validates structure, compiles all conditions. Exits 0 on success.
+  </Card>
+
+  <Card title="Session State & History" icon="clock-rotate-left">
+    Policies can reference:
+    - `session.calls` — number of calls in this session
+    - `history` — last N calls within T seconds
+    - `budget` — spend tracking (via CostShield)
+  </Card>
+
+  <Card title="Type-Safe Expression Language" icon="brackets-curly">
+    Policies use [expr-lang](https://github.com/expr-lang/expr) — sandboxed, type-safe, compiles to bytecode (~1μs per rule evaluation).
+  </Card>
+
+  <Card title="Multi-Agent Governance" icon="users">
+    Govern swarms of agents with cross-agent policies, shared budgets, and loop detection.
+  </Card>
+</CardGroup>
+
+## Architecture Principle
+
+Every successful infrastructure control plane — Terraform, Vault, Datadog, OPA — was built on one architecture decision: **unified core + thin adapters**.
+
+Faramesh follows the same model:
+
+```
+┌─────────────────── FARAMESH INVARIANT CORE ───────────────────┐
+│  Policy Engine │ DPR Chain │ Session State │ DEFER Workflow  │
+│  (YAML+expr)   │ (WAL)     │               │ (channel park)  │
+└─────────────────────────┬─────────────────────────────────────┘
+                          │ CanonicalActionRequest + DPR write
+                          │ (same format regardless of adapter)
+┌─────────────────────────▼─────────────────────────────────────┐
+│              ADAPTER STACK (auto-selected)                     │
+│                                                                │
+│  A1: SDK Shim       A2: Local Daemon      A3: Sidecar + Proxy │
+│  Python/JS/Go       Unix socket           Transparent HTTP     │
+│  <60 sec on-ramp    Works everywhere      Network isolation    │
+└────────────────────────────────────────────────────────────────┘
+```
+
+A developer who writes a Faramesh policy for their notebook has already learned everything needed to govern their production Kubernetes fleet. **Only the adapter changes** — and `faramesh init` selects it automatically.
+
+## Open Source + Cloud Model
+
+Every tool ships with **all features included** in the open-source distribution. Advanced capabilities are plan-gated via Faramesh Cloud:
+
+| Tier | What You Get | Auth Required? |
+|------|--------------|----------------|
+| **Community** | Full core functionality — policies, budgets, observation, signing, SBOM, delegation | No |
+| **Pro** | Cloud sync, rolling window budgets, cloud registry, cloud attestation | Yes (free account) |
+| **Team** | Anomaly detection, cost forecasting, private packs, cross-org swarm | Yes (Team plan) |
+| **Enterprise** | Fleet management, compliance exports, org-wide policies, fleet budgets | Yes (Enterprise plan) |
+
+```bash
+# Login to Faramesh Cloud for advanced features
+faramesh auth login
+```
+
+## What's Next?
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Get from install to first governed function in 5 minutes
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Detailed installation instructions for all platforms
+  </Card>
+  <Card title="Policy Reference" icon="book" href="/policies/writing-policies">
+    Learn how to write policies
+  </Card>
+  <Card title="Python SDK" icon="python" href="/sdk/python">
+    Deep dive into the Python SDK
+  </Card>
+</CardGroup>

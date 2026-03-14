@@ -1,0 +1,510 @@
+---
+title: 'Storage Backends'
+description: 'SQLite, PostgreSQL, and Redis backend architecture and configuration'
+---
+
+## Storage Architecture
+
+Faramesh uses a **WAL-first, multi-tier storage** model:
+
+```
+[1] WAL (Write-Ahead Log)
+      └─ Newline-delimited JSON, fsync after every write
+         Source of truth for audit chain
+         
+[2] DPR Store (SQLite or PostgreSQL)
+      └─ Replicated asynchronously from WAL
+         Rich querying, chain verification
+         
+[3] Session State (Memory or Redis)
+      └─ Call counts, cost accumulators, history ring
+         Ephemeral (can be rebuilt from WAL)
+```
+
+**Key Invariant**: The WAL write completes **before** the decision is returned. If the process crashes between WAL write and DPR replication, the WAL is replayed on restart.
+
+---
+
+## WAL (Write-Ahead Log)
+
+### Format
+
+Newline-delimited JSON (NDJSON):
+
+```json
+{"schema_version":"dpr/1.0","record_id":"uuid","prev_record_hash":"sha256","agent_id":"bot","tool_id":"stripe/refund","effect":"PERMIT",...}
+{"schema_version":"dpr/1.0","record_id":"uuid","prev_record_hash":"sha256","agent_id":"bot","tool_id":"shell/run","effect":"DENY",...}
+```
+
+Each line is a complete DPR record. No delimiters, no headers.
+
+### Implementation
+
+```go title="internal/core/dpr/wal.go"
+type WAL struct {
+    file   *os.File
+    mu     sync.Mutex
+    path   string
+    enc    *json.Encoder
+}
+
+func (w *WAL) Write(rec *Record) error {
+    w.mu.Lock()
+    defer w.mu.Unlock()
+
+    if err := w.enc.Encode(rec); err != nil {
+        return err
+    }
+
+    // CRITICAL: fsync before returning
+    return w.file.Sync()
+}
+```
+
+**Durability**: `file.Sync()` forces the OS to flush kernel buffers to disk. Without this, a crash could lose the last few records.
+
+**Performance**: fsync adds 3-8ms latency on SSDs. On HDDs it can be 20-50ms.
+
+### Replay on Restart
+
+```go
+func ReplayWAL(walPath string, store dpr.StoreBackend) error {
+    f, err := os.Open(walPath)
+    scanner := bufio.NewScanner(f)
+
+    for scanner.Scan() {
+        var rec dpr.Record
+        json.Unmarshal(scanner.Bytes(), &rec)
+
+        // Check if record exists in DPR store
+        if _, err := store.ByID(rec.RecordID); err == nil {
+            continue  // already replicated
+        }
+
+        // Not in store → replicate now
+        store.Save(&rec)
+    }
+    return scanner.Err()
+}
+```
+
+Run on daemon startup. Ensures no gap in the DPR chain.
+
+---
+
+## DPR Store: SQLite
+
+**Use Case**: Single-node deployments, development, demos.
+
+**Location**: `~/.faramesh/faramesh.db` (default)
+
+### Schema
+
+```sql title="internal/core/dpr/sqlite.go"
+CREATE TABLE IF NOT EXISTS dpr_records (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    schema_version             TEXT NOT NULL DEFAULT 'dpr/1.0',
+    record_id                  TEXT NOT NULL UNIQUE,
+    prev_record_hash           TEXT NOT NULL,
+    record_hash                TEXT NOT NULL,
+    agent_id                   TEXT NOT NULL,
+    session_id                 TEXT,
+    tool_id                    TEXT NOT NULL,
+    intercept_adapter          TEXT,
+    principal_id_hash          TEXT DEFAULT '',
+    effect                     TEXT NOT NULL,
+    matched_rule_id            TEXT,
+    reason_code                TEXT,
+    reason                     TEXT,
+    denial_token               TEXT DEFAULT '',
+    incident_category          TEXT DEFAULT '',
+    incident_severity          TEXT DEFAULT '',
+    policy_version             TEXT,
+    args_structural_sig        TEXT,
+    arg_provenance             TEXT DEFAULT '',      -- JSON
+    selector_snapshot          TEXT DEFAULT '',      -- JSON
+    custom_operators_evaluated TEXT DEFAULT '',      -- JSON
+    operator_results           TEXT DEFAULT '',      -- JSON
+    workflow_phase             TEXT DEFAULT '',
+    credential_brokered        INTEGER DEFAULT 0,
+    execution_environment      TEXT DEFAULT '',
+    invoked_by_agent_id        TEXT DEFAULT '',
+    invoked_by_dpr_id          TEXT DEFAULT '',
+    callbacks_fired            TEXT DEFAULT '',      -- JSON
+    degraded_mode              TEXT DEFAULT '',
+    batch_approval             INTEGER DEFAULT 0,
+    batch_size                 INTEGER DEFAULT 0,
+    batch_dpr_ids              TEXT DEFAULT '',      -- JSON
+    created_at                 TEXT NOT NULL
+);
+
+CREATE INDEX idx_dpr_agent_time ON dpr_records(agent_id, created_at);
+CREATE INDEX idx_dpr_effect ON dpr_records(effect, created_at);
+CREATE INDEX idx_dpr_session ON dpr_records(session_id, created_at);
+CREATE INDEX idx_dpr_incident ON dpr_records(incident_category, incident_severity);
+```
+
+### Operations
+
+```go
+// Save a record (async from WAL)
+func (s *Store) Save(rec *Record) error
+
+// Query by record ID
+func (s *Store) ByID(recordID string) (*Record, error)
+
+// Recent records for an agent
+func (s *Store) RecentByAgent(agentID string, limit int) ([]*Record, error)
+
+// All recent records (audit tail)
+func (s *Store) Recent(limit int) ([]*Record, error)
+
+// Last record hash (for chain seeding on restart)
+func (s *Store) LastHash(agentID string) (string, error)
+
+// Verify chain integrity
+func (s *Store) VerifyChain(agentID string) (*ChainBreak, error)
+```
+
+### Chain Verification
+
+```bash
+faramesh audit verify ~/.faramesh/faramesh.db
+```
+
+```go
+func (s *Store) VerifyChain(agentID string) (*ChainBreak, error) {
+    records := s.loadRecordsChronological(agentID)
+
+    for i, rec := range records {
+        // Recompute hash from canonical bytes
+        saved := rec.RecordHash
+        rec.ComputeHash()
+        if rec.RecordHash != saved {
+            return &ChainBreak{
+                RecordID:     rec.RecordID,
+                Position:     i,
+                ExpectedHash: rec.RecordHash,
+                ActualHash:   saved,
+            }, nil
+        }
+
+        // Verify chain link
+        if i > 0 && rec.PrevRecordHash != records[i-1].RecordHash {
+            return &ChainBreak{
+                RecordID:     rec.RecordID,
+                Position:     i,
+                ExpectedHash: records[i-1].RecordHash,
+            }, nil
+        }
+    }
+
+    return nil, nil  // chain intact
+}
+```
+
+**Output** (on tampering):
+```
+✗ Chain integrity violation detected
+  Record ID: abc123...
+  Position: 142
+  Expected hash: sha256:def456...
+  Actual hash:   sha256:xyz789...
+```
+
+---
+
+## DPR Store: PostgreSQL
+
+**Use Case**: Multi-node production deployments, high availability.
+
+**Configuration**:
+```bash
+export FARAMESH_DPR_DSN="postgres://user:pass@localhost/faramesh?sslmode=require"
+faramesh serve --policy policy.yaml
+```
+
+### Schema
+
+```sql title="internal/core/dpr/postgres.go"
+CREATE TABLE IF NOT EXISTS dpr_records (
+    id                         BIGSERIAL PRIMARY KEY,
+    schema_version             TEXT NOT NULL DEFAULT 'dpr/1.0',
+    record_id                  TEXT NOT NULL UNIQUE,
+    prev_record_hash           TEXT NOT NULL,
+    record_hash                TEXT NOT NULL,
+    agent_id                   TEXT NOT NULL,
+    session_id                 TEXT,
+    tool_id                    TEXT NOT NULL,
+    intercept_adapter          TEXT,
+    principal_id_hash          TEXT DEFAULT '',
+    effect                     TEXT NOT NULL,
+    matched_rule_id            TEXT,
+    reason_code                TEXT,
+    reason                     TEXT,
+    policy_version             TEXT,
+    args_structural_sig        TEXT,
+    arg_provenance             JSONB DEFAULT '{}',
+    selector_snapshot          JSONB DEFAULT '{}',
+    custom_operators_evaluated JSONB DEFAULT '[]',
+    operator_results           JSONB DEFAULT '{}',
+    callbacks_fired            JSONB DEFAULT '[]',
+    batch_dpr_ids              JSONB DEFAULT '[]',
+    created_at                 TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_dpr_agent_time ON dpr_records(agent_id, created_at);
+CREATE INDEX idx_dpr_effect ON dpr_records(effect, created_at);
+CREATE INDEX idx_dpr_session ON dpr_records(session_id, created_at);
+CREATE INDEX idx_dpr_incident ON dpr_records(incident_category, incident_severity);
+CREATE INDEX idx_dpr_record_hash ON dpr_records(record_hash);
+```
+
+**Key Differences from SQLite**:
+- JSONB columns for rich querying (e.g., `WHERE arg_provenance->>'source' = 'external'`)
+- TIMESTAMPTZ for timezone-aware timestamps
+- BIGSERIAL for unlimited growth
+
+### Connection Pooling
+
+```go
+func OpenPGStore(dsn string) (*PGStore, error) {
+    db, err := sql.Open("pgx", dsn)
+    db.SetMaxOpenConns(25)
+    db.SetMaxIdleConns(5)
+    db.SetConnMaxLifetime(5 * time.Minute)
+    return &PGStore{db: db}, nil
+}
+```
+
+### Multi-Node Writes
+
+Each daemon writes to the same PostgreSQL table. Records are serialized by `created_at` timestamp.
+
+**Chain Construction**: Each daemon maintains its own in-memory chain hash cache per agent. On restart, it seeds from PostgreSQL:
+
+```go
+func (p *Pipeline) seedChainHashes(store dpr.StoreBackend) {
+    agents, _ := store.KnownAgents()
+    for _, agentID := range agents {
+        lastHash, _ := store.LastHash(agentID)
+        p.chainMu[agentID] = lastHash
+    }
+}
+```
+
+---
+
+## Session State: In-Memory
+
+**Use Case**: Single-node deployments, development.
+
+**Implementation**:
+
+```go title="internal/core/session/memory_backend.go"
+type MemoryBackend struct {
+    mu          sync.RWMutex
+    callCounts  map[string]int64              // agentID → count
+    sessionCost map[string]float64            // agentID → USD
+    dailyCost   map[string]float64            // agentID → USD
+    history     map[string][]HistoryEntry     // agentID → ring buffer
+    killed      map[string]bool               // agentID → killed?
+}
+
+func (b *MemoryBackend) IncrCallCount(ctx context.Context, agentID, sessionID string) (int64, error) {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    b.callCounts[agentID]++
+    return b.callCounts[agentID], nil
+}
+```
+
+**Limitation**: State is lost on daemon restart. For stateful budgets and history, use Redis.
+
+---
+
+## Session State: Redis
+
+**Use Case**: Multi-node deployments, shared session state across daemon replicas.
+
+**Configuration**:
+```bash
+export FARAMESH_SESSION_REDIS="redis://localhost:6379/0"
+faramesh serve --policy policy.yaml
+```
+
+### Key Layout
+
+```
+faramesh:sess:{agentID}:calls                 → INT64 call counter
+faramesh:sess:{agentID}:cost:sess             → FLOAT64 session cost
+faramesh:sess:{agentID}:cost:day:{YYYY-MM-DD} → FLOAT64 daily cost
+faramesh:sess:{agentID}:history               → LIST of JSON HistoryEntry
+faramesh:sess:{agentID}:killed                → "1" if killed
+```
+
+### Operations
+
+```go title="internal/core/session/redis_backend.go"
+type RedisBackend struct {
+    client     redis.Cmdable  // Supports standalone, cluster, sentinel
+    keyPrefix  string
+    sessionTTL time.Duration  // Default: 24h
+    dailyTTL   time.Duration  // Default: 48h
+}
+
+func (b *RedisBackend) IncrCallCount(ctx context.Context, agentID, _ string) (int64, error) {
+    k := b.keyPrefix + agentID + ":calls"
+    val, err := b.client.Incr(ctx, k).Result()
+    b.client.Expire(ctx, k, b.sessionTTL)
+    return val, err
+}
+
+func (b *RedisBackend) AddCost(ctx context.Context, agentID, _ string, costUSD float64) (float64, float64, error) {
+    sessKey := b.keyPrefix + agentID + ":cost:sess"
+    dayKey := b.keyPrefix + agentID + ":cost:day:" + todayUTC()
+
+    pipe := b.client.Pipeline()
+    sessCmd := pipe.IncrByFloat(ctx, sessKey, costUSD)
+    dayCmd := pipe.IncrByFloat(ctx, dayKey, costUSD)
+    pipe.Expire(ctx, sessKey, b.sessionTTL)
+    pipe.Expire(ctx, dayKey, b.dailyTTL)
+    pipe.Exec(ctx)
+
+    return sessCmd.Val(), dayCmd.Val(), nil
+}
+```
+
+### Atomic Budget Checks
+
+Use Lua scripts to prevent TOCTOU races:
+
+```lua title="Check-and-Reserve Lua Script"
+local cost = tonumber(ARGV[1])
+local sess_limit = tonumber(ARGV[2])
+local day_limit = tonumber(ARGV[3])
+
+local sess_cost = tonumber(redis.call('GET', KEYS[1]) or '0')
+local day_cost = tonumber(redis.call('GET', KEYS[2]) or '0')
+
+if sess_limit > 0 and (sess_cost + cost) > sess_limit then
+  return 0  -- budget exceeded
+end
+if day_limit > 0 and (day_cost + cost) > day_limit then
+  return 0  -- budget exceeded
+end
+
+-- Reserve cost
+redis.call('INCRBYFLOAT', KEYS[1], cost)
+redis.call('INCRBYFLOAT', KEYS[2], cost)
+return 1  -- success
+```
+
+```go
+func (b *RedisBackend) CheckAndReserveCost(ctx context.Context, agentID, _ string,
+    costUSD, sessionLimit, dailyLimit float64) (bool, error) {
+    
+    result, err := checkAndReserveLua.Run(ctx, b.client,
+        []string{sessKey, dayKey},
+        costUSD, sessionLimit, dailyLimit,
+    ).Int64()
+    
+    return result == 1, err
+}
+```
+
+**Guarantees**: No race conditions. The check-and-increment is atomic at the Redis server.
+
+---
+
+## Storage Tier Comparison
+
+| Storage Tier | Durability | Performance | Query Capability | Multi-Node |
+|--------------|------------|-------------|------------------|------------|
+| **WAL** | Durable (fsync) | 3-8ms write | Sequential scan only | Single writer |
+| **SQLite** | Durable | 1-5ms read | Rich (SQL) | Single node |
+| **PostgreSQL** | Durable (replication) | 2-10ms read/write | Rich (SQL + JSONB) | Multi-node |
+| **Redis (session)** | Ephemeral (AOF optional) | &lt;1ms read/write | Limited | Multi-node |
+| **Memory (session)** | Volatile | &lt;100ns | N/A | Single node |
+
+---
+
+## Configuration Examples
+
+### Single-Node Development
+
+```bash
+# In-memory session state, SQLite DPR store
+faramesh serve --policy policy.yaml
+```
+
+State lost on restart. DPR persisted to `~/.faramesh/faramesh.db`.
+
+---
+
+### Single-Node Production
+
+```bash
+# Redis session state (survives restarts), SQLite DPR store
+export FARAMESH_SESSION_REDIS="redis://localhost:6379/0"
+faramesh serve --policy policy.yaml
+```
+
+Session state persists across daemon restarts. DPR in SQLite.
+
+---
+
+### Multi-Node Production
+
+```bash
+# Redis session state, PostgreSQL DPR store
+export FARAMESH_SESSION_REDIS="redis://redis-cluster:6379/0"
+export FARAMESH_DPR_DSN="postgres://user:pass@pg-primary/faramesh"
+faramesh serve --policy policy.yaml
+```
+
+Multiple daemon replicas share state via Redis. DPR replicated to PostgreSQL.
+
+---
+
+## Backup & Recovery
+
+### WAL Backup
+
+```bash
+# WAL is the source of truth — back it up continuously
+cp ~/.faramesh/wal.jsonl /backup/wal-$(date +%s).jsonl
+```
+
+### DPR Store Backup
+
+**SQLite**:
+```bash
+sqlite3 ~/.faramesh/faramesh.db ".backup /backup/faramesh-$(date +%s).db"
+```
+
+**PostgreSQL**:
+```bash
+pg_dump faramesh > /backup/faramesh-$(date +%s).sql
+```
+
+### Recovery
+
+1. Restore WAL
+2. Replay WAL into empty DPR store:
+   ```bash
+   faramesh audit replay --wal wal.jsonl --store faramesh.db
+   ```
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Pipeline Architecture" icon="diagram-project" href="/architecture/pipeline">
+    Understand the 11-step governance flow
+  </Card>
+  <Card title="Policy Reference" icon="file-code" href="/reference/policy-yaml">
+    Write policies using the full FPL schema
+  </Card>
+</CardGroup>

@@ -1,0 +1,532 @@
+---
+title: Expression Language
+description: expr-lang expression syntax and built-in helpers for policy conditions
+icon: function
+---
+
+Faramesh uses [expr-lang](https://expr-lang.org/) to evaluate policy conditions. Conditions are compiled to bytecode at policy load time and evaluated at ~1μs per rule.
+
+## Expression Basics
+
+Expressions appear in the `when:` field of policy rules:
+
+```yaml
+rules:
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+```
+
+### Syntax Overview
+
+| Operator | Example | Description |
+|----------|---------|-------------|
+| `==` | `args["status"] == "active"` | Equality |
+| `!=` | `args["tier"] != "free"` | Inequality |
+| `>`, `>=` | `args["amount"] > 500` | Comparison |
+| `<`, `<=` | `session.call_count < 10` | Comparison |
+| `&&` | `args["amount"] > 500 && args["currency"] == "USD"` | Logical AND |
+| `||` | `tool.blast_radius == "external" || tool.blast_radius == "system"` | Logical OR |
+| `!` | `!principal.verified` | Logical NOT |
+| `in` | `"admin" in principal.role` | Membership |
+| `matches` | `args["cmd"] matches "rm\\s+-[rf]"` | Regex match |
+| `contains` | `contains(tool.tags, "financial")` | Array contains |
+| `len` | `len(args["recipients"]) > 50` | Array/string length |
+
+## Available Variables
+
+Expressions have access to these context variables:
+
+### `args` — Tool Call Arguments
+
+The arguments passed to the tool call:
+
+```yaml
+when: 'args["amount"] > 500'
+when: 'args["currency"] == "USD"'
+when: 'args["recipients"][0] == "ceo@company.com"'
+when: 'len(args["recipients"]) > 50'
+```
+
+### `vars` — Policy Variables
+
+Variables defined in the policy's `vars:` block:
+
+```yaml
+vars:
+  max_refund: 500
+  allowed_domains: [internal.example.com, api.company.com]
+
+rules:
+  - when: 'args["amount"] > vars["max_refund"]'
+  - when: 'contains(vars["allowed_domains"], args["domain"])'
+```
+
+### `session` — Session Context
+
+Session-level data:
+
+<ParamField path="session.call_count" type="int64">
+  Total tool calls in this session.
+  
+  ```yaml
+  when: 'session.call_count > 100'
+  ```
+</ParamField>
+
+<ParamField path="session.history" type="array">
+  Array of recent tool calls (newest first). Each entry has:
+  - `tool` — tool ID
+  - `effect` — `PERMIT`, `DENY`, or `DEFER`
+  - `timestamp` — Unix timestamp
+  
+  ```yaml
+  when: 'len(session.history) > 10'
+  ```
+  
+  Use [history helper functions](#history-helpers) instead of accessing directly.
+</ParamField>
+
+<ParamField path="session.cost_usd" type="float64">
+  Total USD cost for this session (when CostShield is enabled).
+  
+  ```yaml
+  when: 'session.cost_usd > 5.0'
+  ```
+</ParamField>
+
+<ParamField path="session.daily_cost_usd" type="float64">
+  Total USD cost today (when CostShield is enabled).
+  
+  ```yaml
+  when: 'session.daily_cost_usd > 100.0'
+  ```
+</ParamField>
+
+### `tool` — Tool Metadata
+
+Metadata declared in the policy's `tools:` block:
+
+<ParamField path="tool.reversibility" type="string">
+  How easily actions can be undone: `read_only`, `reversible`, `compensatable`, `irreversible`
+  
+  ```yaml
+  when: 'tool.reversibility == "irreversible"'
+  ```
+</ParamField>
+
+<ParamField path="tool.blast_radius" type="string">
+  Scope of impact: `none`, `local`, `scoped`, `system`, `external`
+  
+  ```yaml
+  when: 'tool.blast_radius == "external"'
+  ```
+</ParamField>
+
+<ParamField path="tool.tags" type="array">
+  String tags for grouping.
+  
+  ```yaml
+  when: 'contains(tool.tags, "financial")'
+  when: 'contains(tool.tags, "pii_source")'
+  ```
+</ParamField>
+
+### `principal` — User Identity
+
+The invoking user's identity (when authentication is enabled):
+
+<ParamField path="principal.id" type="string">
+  IDP-verified identity (e.g., `user@company.com`)
+  
+  ```yaml
+  when: 'principal.id == "admin@company.com"'
+  ```
+</ParamField>
+
+<ParamField path="principal.tier" type="string">
+  SaaS tier: `free`, `pro`, `enterprise`
+  
+  ```yaml
+  when: 'principal.tier == "free" && args["amount"] > 100'
+  ```
+</ParamField>
+
+<ParamField path="principal.role" type="string">
+  Organizational role: `analyst`, `operator`, `admin`
+  
+  ```yaml
+  when: 'principal.role != "admin"'
+  ```
+</ParamField>
+
+<ParamField path="principal.org" type="string">
+  Organization identifier.
+  
+  ```yaml
+  when: 'principal.org == "acme-corp"'
+  ```
+</ParamField>
+
+<ParamField path="principal.verified" type="boolean">
+  Whether identity is IDP-verified.
+  
+  ```yaml
+  when: '!principal.verified && tool.blast_radius == "external"'
+  ```
+</ParamField>
+
+### `delegation` — Multi-Agent Context
+
+Delegation chain for orchestrated multi-agent workflows:
+
+<ParamField path="delegation.depth" type="int">
+  Delegation chain depth (0 = direct invocation).
+  
+  ```yaml
+  when: 'delegation.depth > 2'
+  ```
+</ParamField>
+
+<ParamField path="delegation.origin_agent" type="string">
+  Root orchestrator agent ID.
+  
+  ```yaml
+  when: 'delegation.origin_agent == "trusted_orchestrator"'
+  ```
+</ParamField>
+
+<ParamField path="delegation.origin_org" type="string">
+  Root orchestrator organization.
+</ParamField>
+
+<ParamField path="delegation.agent_identity_verified" type="boolean">
+  Whether all agents in the chain are verified.
+  
+  ```yaml
+  when: '!delegation.agent_identity_verified'
+  ```
+</ParamField>
+
+### `time` — Temporal Context
+
+Wall-clock time at evaluation (UTC):
+
+<ParamField path="time.hour" type="int">
+  Current hour (0-23).
+  
+  ```yaml
+  when: 'time.hour >= 0 && time.hour < 6'  # Night hours
+  ```
+</ParamField>
+
+<ParamField path="time.weekday" type="int">
+  Current day of week (1=Monday, 7=Sunday).
+  
+  ```yaml
+  when: 'time.weekday >= 6'  # Weekend
+  ```
+</ParamField>
+
+<ParamField path="time.month" type="int">
+  Current month (1-12).
+</ParamField>
+
+<ParamField path="time.day" type="int">
+  Current day of month (1-31).
+</ParamField>
+
+## Built-In Helper Functions
+
+Faramesh provides specialized helper functions for common policy patterns.
+
+### History Helpers
+
+<ParamField path="history_contains_within(tool_pattern, seconds)" type="bool">
+  Returns `true` if any call matching `tool_pattern` occurred within the last `seconds` seconds.
+  
+  ```yaml
+  # Defer delete if data was sent externally in last 2 minutes
+  when: 'history_contains_within("http/post", 120)'
+  
+  # Defer HTTP if secrets were accessed in last 5 minutes
+  when: 'history_contains_within("secrets/*", 300) || history_contains_within("vault/*", 300)'
+  ```
+</ParamField>
+
+<ParamField path="history_sequence(tool_a, tool_b, ...)" type="bool">
+  Returns `true` if the given tools appear in order (not necessarily contiguous) in session history.
+  
+  ```yaml
+  # Deny shell if session shows read → exfil pattern
+  when: 'history_sequence("read_file", "http/post")'
+  
+  # Defer if credential access → database → outbound sequence
+  when: 'history_sequence("vault/read", "db/query", "http/post")'
+  ```
+</ParamField>
+
+<ParamField path="history_tool_count(tool_pattern)" type="int">
+  Returns count of calls matching `tool_pattern` in the history window.
+  
+  ```yaml
+  # Defer if more than 5 Stripe calls in session
+  when: 'history_tool_count("stripe/*") > 5'
+  
+  # Deny if excessive refunds
+  when: 'history_tool_count("stripe/refund") >= 10'
+  ```
+</ParamField>
+
+<ParamField path="deny_count_within(seconds)" type="int">
+  Returns count of DENY outcomes in the last `seconds` seconds.
+  
+  ```yaml
+  # Defer if 3+ denials in last minute (potential attack)
+  when: 'deny_count_within(60) >= 3'
+  ```
+</ParamField>
+
+### Array Helpers
+
+<ParamField path="args_array_len(path)" type="int">
+  Returns length of array argument at `path`.
+  
+  ```yaml
+  # Deny mass email
+  when: 'args_array_len("recipients") > 50'
+  
+  # Defer bulk operations
+  when: 'args_array_len("operations") > 100'
+  ```
+</ParamField>
+
+<ParamField path="args_array_contains(path, value)" type="bool">
+  Returns `true` if array at `path` contains `value`.
+  
+  ```yaml
+  # Defer if CEO is recipient
+  when: 'args_array_contains("recipients", "ceo@company.com")'
+  ```
+</ParamField>
+
+<ParamField path="args_array_any_match(path, pattern)" type="bool">
+  Returns `true` if any array element at `path` matches glob `pattern`.
+  
+  ```yaml
+  # Defer if any recipient is external
+  when: 'args_array_any_match("recipients", "*@external.com")'
+  
+  # Deny if any domain not in allowlist
+  when: 'args_array_any_match("domains", "*") && !args_array_any_match("domains", "*.internal.com")'
+  ```
+</ParamField>
+
+<ParamField path="contains(array, value)" type="bool">
+  Generic array membership test.
+  
+  ```yaml
+  when: 'contains(tool.tags, "financial")'
+  when: 'contains(vars["approved_users"], principal.id)'
+  ```
+</ParamField>
+
+### String Helpers
+
+<ParamField path="matches" type="operator">
+  Regex match operator.
+  
+  ```yaml
+  # Deny destructive shell commands
+  when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs"'
+  
+  # Deny SQL injection patterns
+  when: 'args["query"] matches "(?i)(DROP|DELETE)\\s+TABLE"'
+  ```
+</ParamField>
+
+<ParamField path="len(value)" type="int">
+  Returns length of string or array.
+  
+  ```yaml
+  when: 'len(args["description"]) > 1000'
+  when: 'len(args["recipients"]) > 50'
+  ```
+</ParamField>
+
+## Expression Examples
+
+### Financial Thresholds
+
+```yaml
+# Defer refunds over $500
+when: 'args["amount"] > vars["max_refund"]'
+
+# Defer high-value operations for free tier
+when: 'principal.tier == "free" && args["amount"] > 100'
+
+# Deny if session cost exceeds daily budget
+when: 'session.daily_cost_usd > vars["daily_budget"]'
+```
+
+### Security Patterns
+
+```yaml
+# Deny destructive shell commands
+when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "dd\\s+if="'
+
+# Defer unverified principals on external tools
+when: '!principal.verified && tool.blast_radius == "external"'
+
+# Deny if secrets were accessed then HTTP called (exfil pattern)
+when: 'history_sequence("vault/read", "http/post")'
+```
+
+### Rate Limiting
+
+```yaml
+# Defer if more than 10 calls in session
+when: 'session.call_count > 10'
+
+# Defer if 5+ Stripe calls already
+when: 'history_tool_count("stripe/*") >= 5'
+
+# Deny if 3+ denials in last minute (potential attack)
+when: 'deny_count_within(60) >= 3'
+```
+
+### Temporal Controls
+
+```yaml
+# Defer high-value operations outside business hours
+when: 'args["amount"] > 1000 && (time.hour < 9 || time.hour >= 17)'
+
+# Defer weekend operations
+when: 'time.weekday >= 6 && tool.blast_radius == "external"'
+
+# Deny night operations for irreversible tools
+when: 'time.hour >= 0 && time.hour < 6 && tool.reversibility == "irreversible"'
+```
+
+### Multi-Agent Delegation
+
+```yaml
+# Defer deeply nested delegation
+when: 'delegation.depth > 2'
+
+# Deny unverified delegation chains
+when: 'delegation.depth > 0 && !delegation.agent_identity_verified'
+
+# Defer if not from trusted orchestrator
+when: 'delegation.origin_agent != "trusted_orchestrator"'
+```
+
+### Data Exfiltration Detection
+
+```yaml
+# Defer delete after recent external HTTP call
+- id: defer-delete-after-exfil
+  match:
+    tool: delete_*
+    when: 'history_contains_within("http/post", 120)'
+  effect: defer
+  reason: Delete blocked after external data transmission
+
+# Deny HTTP after credential access
+- id: deny-http-after-secret-access
+  match:
+    tool: http/*
+    when: 'history_contains_within("secrets/*", 300)'
+  effect: deny
+  reason: Outbound HTTP blocked after credential access
+
+# Defer if read → shell → HTTP sequence detected
+- id: defer-suspicious-sequence
+  match:
+    tool: http/*
+    when: 'history_sequence("read_file", "shell/exec")'
+  effect: defer
+  reason: Suspicious execution pattern detected
+```
+
+### Mass Operations
+
+```yaml
+# Deny mass email
+when: 'args_array_len("recipients") > vars["max_email_recipients"]'
+
+# Defer if any recipient is external
+when: 'args_array_any_match("recipients", "*@external.com")'
+
+# Defer bulk database operations
+when: 'args_array_len("operations") > 100'
+```
+
+## Custom Operators (Advanced)
+
+You can register custom Go functions as policy operators. See `internal/core/policy/operators.go`.
+
+Example usage in policy:
+
+```yaml
+when: 'risk_score(args["account_id"]) > 0.8'
+when: 'geo_fence(args["ip_address"], "us-east-1")'
+```
+
+Custom operators must:
+- Be deterministic (same input → same output)
+- Complete within 10ms timeout
+- Have no side effects
+
+## Performance Notes
+
+- Expressions are compiled to bytecode at policy load time
+- Evaluation is **~1μs per rule** (extremely fast)
+- History helper functions scan session history (usually &lt;100 entries)
+- Regex `matches` is slower than simple comparisons — use sparingly
+
+## Testing Expressions
+
+Test expressions with `faramesh policy test`:
+
+```bash
+faramesh policy test policy.yaml \
+  --tool stripe/refund \
+  --args '{"amount":600,"currency":"USD"}'
+```
+
+The output shows which rule matched and the evaluation result.
+
+## Expression Debugging
+
+If a `when:` expression fails to compile, you'll see an error during validation:
+
+```bash
+$ faramesh policy validate policy.yaml
+✗ rule "defer-high-value": invalid when expression: 
+  undefined variable "ammount" (did you mean "amount"?)
+```
+
+Common mistakes:
+- Missing quotes around strings: `args[amount]` → `args["amount"]`
+- Wrong operator: `args["status"] = "active"` → `args["status"] == "active"`
+- Unescaped regex backslashes: `"\\d+"` not `"\d+"`
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Scanners" icon="radar" href="/policies/scanners">
+    Post-execution output scanning
+  </Card>
+  <Card title="Testing" icon="flask" href="/policies/testing">
+    Validate and test policies
+  </Card>
+  <Card title="Best Practices" icon="lightbulb" href="/policies/best-practices">
+    Policy patterns and anti-patterns
+  </Card>
+  <Card title="Writing Policies" icon="pen-to-square" href="/policies/writing-policies">
+    Policy writing guide
+  </Card>
+</CardGroup>

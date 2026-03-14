@@ -1,0 +1,678 @@
+---
+title: Troubleshooting
+description: Common deployment issues and solutions
+---
+
+## Daemon Issues
+
+### Daemon Won't Start
+
+#### Symptom
+
+```
+Error: failed to start daemon: compile policy: unknown tool: stripe/refund
+```
+
+#### Solution
+
+Validate your policy first:
+
+```bash
+faramesh policy validate policy.yaml
+```
+
+Check for:
+- Syntax errors (YAML indentation)
+- Unknown fields
+- Missing required fields (`faramesh-version`, `agent-id`)
+- References to undefined tools in `match.when` conditions
+
+Run with debug logs to see detailed errors:
+
+```bash
+faramesh serve --policy policy.yaml --log-level debug
+```
+
+### Cannot Create Data Directory
+
+#### Symptom
+
+```
+Error: create data dir: permission denied
+```
+
+#### Solution
+
+Ensure the daemon has write permissions:
+
+```bash
+sudo mkdir -p /var/lib/faramesh
+sudo chown faramesh:faramesh /var/lib/faramesh
+sudo chmod 700 /var/lib/faramesh
+```
+
+Or specify a writable directory:
+
+```bash
+faramesh serve --policy policy.yaml --data-dir ./faramesh-data
+```
+
+### Socket Already in Use
+
+#### Symptom
+
+```
+Error: start SDK server: bind: address already in use
+```
+
+#### Solution
+
+Another daemon is already running. Check:
+
+```bash
+ls -l /tmp/faramesh.sock
+pgrep -a faramesh
+```
+
+Kill the existing daemon:
+
+```bash
+sudo kill $(cat /var/lib/faramesh/faramesh.pid)
+```
+
+Or use a different socket path:
+
+```bash
+faramesh serve --policy policy.yaml --socket /tmp/faramesh-2.sock
+```
+
+## Connection Issues
+
+### `audit tail` Cannot Connect
+
+#### Symptom
+
+```bash
+faramesh audit tail
+Error: dial unix /tmp/faramesh.sock: connect: no such file or directory
+```
+
+#### Solution
+
+Daemon is not running. Start it:
+
+```bash
+faramesh serve --policy policy.yaml
+```
+
+If the daemon is running on a different socket path:
+
+```bash
+faramesh audit tail --socket /var/run/faramesh.sock
+```
+
+### SDK Cannot Connect
+
+#### Symptom (Python)
+
+```python
+from faramesh import Faramesh
+fm = Faramesh()
+# ConnectionError: [Errno 2] No such file or directory: '/tmp/faramesh.sock'
+```
+
+#### Solution
+
+Verify the socket exists:
+
+```bash
+ls -l /tmp/faramesh.sock
+```
+
+Match the socket path in your SDK code:
+
+```python
+fm = Faramesh(socket_path="/var/run/faramesh.sock")
+```
+
+Check permissions:
+
+```bash
+sudo chmod 770 /tmp/faramesh.sock
+sudo chown faramesh:agents /tmp/faramesh.sock
+```
+
+### gRPC Connection Refused
+
+#### Symptom
+
+```
+Error: dial tcp 127.0.0.1:50051: connect: connection refused
+```
+
+#### Solution
+
+Daemon is not started with `--grpc-port`:
+
+```bash
+faramesh serve --policy policy.yaml --grpc-port 50051
+```
+
+Check if port is already in use:
+
+```bash
+lsof -i :50051
+```
+
+## Policy Issues
+
+### Everything is Denied
+
+#### Symptom
+
+```
+Effect: DENY
+Reason: No matching rule — default deny
+ReasonCode: DEFAULT_DENY
+```
+
+#### Solution
+
+Your policy has no matching rule for the tool. Add a rule or change `default_effect`:
+
+```yaml
+rules:
+  - id: allow-http-get
+    match:
+      tool: "http/get"
+    effect: permit
+
+  - id: default-deny
+    match:
+      tool: "*"
+    effect: deny
+
+default_effect: deny  # Change to 'permit' for testing (NOT recommended for production)
+```
+
+### Lots of DEFERs, Nothing Executes
+
+#### Symptom
+
+```
+Effect: DEFER
+Reason: Shell commands require human approval
+DeferToken: def_abc123
+```
+
+#### Solution
+
+Your policy intentionally requires manual approval. Approve manually:
+
+```bash
+faramesh agent approve def_abc123
+```
+
+Or change the rule to `permit` (if safe):
+
+```yaml
+- id: allow-shell-exec
+  match:
+    tool: "shell/*"
+  effect: permit  # Changed from defer
+```
+
+### Policy Reload Fails
+
+#### Symptom
+
+```bash
+kill -HUP $(cat /var/lib/faramesh/faramesh.pid)
+# Daemon logs: policy reload failed — continuing with current policy
+```
+
+#### Solution
+
+The new policy has errors. Check daemon logs:
+
+```bash
+journalctl -u faramesh -n 50
+```
+
+Validate before reloading:
+
+```bash
+faramesh policy validate policy.yaml
+```
+
+The daemon keeps the old policy active if reload fails.
+
+## Audit & DPR Issues
+
+### Chain Verify Fails
+
+#### Symptom
+
+```bash
+faramesh audit verify /var/lib/faramesh/faramesh.db
+Chain break detected at position 47:
+  Record ID: dpr_1234567890
+  Expected hash: abc123...
+  Actual hash: def456...
+```
+
+#### Solution
+
+<Warning>
+Chain breaks indicate **data integrity issues**. Treat as a security incident.
+</Warning>
+
+Possible causes:
+1. WAL or database file corruption (filesystem issue)
+2. Manual database tampering
+3. Bug in Faramesh (rare)
+
+**Investigation steps:**
+
+1. Check WAL integrity:
+   ```bash
+   faramesh audit verify --wal /var/lib/faramesh/faramesh.wal
+   ```
+
+2. Restore from backup:
+   ```bash
+   cp /backup/faramesh.wal /var/lib/faramesh/faramesh.wal
+   faramesh audit rebuild --wal /var/lib/faramesh/faramesh.wal
+   ```
+
+3. Report to security team and investigate root cause.
+
+### WAL Write Errors
+
+#### Symptom
+
+Daemon logs:
+
+```json
+{"level":"error","msg":"WAL write failed","error":"disk full"}
+```
+
+Metrics:
+
+```prometheus
+faramesh_wal_writes_total{status="error"} 23
+```
+
+#### Solution
+
+Disk space issue. Free up space:
+
+```bash
+df -h /var/lib/faramesh
+du -sh /var/lib/faramesh/*
+```
+
+Rotate old WAL files:
+
+```bash
+mv /var/lib/faramesh/faramesh.wal /backup/faramesh-$(date +%Y%m%d).wal
+touch /var/lib/faramesh/faramesh.wal
+```
+
+Restart daemon.
+
+### PostgreSQL Connection Fails
+
+#### Symptom
+
+```
+Error: open PostgreSQL DPR store: dial tcp: connection refused
+```
+
+#### Solution
+
+PostgreSQL is unreachable. Check DSN:
+
+```bash
+faramesh serve --dpr-dsn "postgres://user:pass@localhost:5432/faramesh?sslmode=require"
+```
+
+Test connection:
+
+```bash
+psql "postgres://user:pass@localhost:5432/faramesh"
+```
+
+If PostgreSQL is down, Faramesh will continue with SQLite only (if enabled).
+
+## Adapter Issues
+
+### HTTP Proxy Returns 502
+
+#### Symptom
+
+```bash
+curl -X POST http://localhost:8080/v1/authorize -d '{...}'
+502 Bad Gateway
+```
+
+#### Solution
+
+Daemon is not running or not started with `--proxy-port`:
+
+```bash
+faramesh serve --policy policy.yaml --proxy-port 8080
+```
+
+Check if port is in use:
+
+```bash
+lsof -i :8080
+```
+
+### MCP Gateway Returns 502
+
+#### Symptom
+
+```bash
+curl http://localhost:8090
+502 Bad Gateway
+```
+
+#### Solution
+
+Upstream MCP server (`--mcp-target`) is down/unreachable:
+
+```bash
+faramesh serve \
+  --policy policy.yaml \
+  --mcp-proxy-port 8090 \
+  --mcp-target http://localhost:3000  # Verify this is running
+```
+
+Test upstream directly:
+
+```bash
+curl http://localhost:3000
+```
+
+If upstream is down, start it before starting the gateway.
+
+### eBPF Not Available on macOS
+
+#### Symptom
+
+```
+Error: eBPF adapter requires Linux kernel
+```
+
+#### Solution
+
+**Expected behavior.** eBPF requires Linux kernel ≥5.8.
+
+On macOS, use:
+- **SDK adapter** (Unix socket) — recommended
+- **HTTP proxy adapter**
+- **MCP gateway adapter**
+
+See [adapters documentation](/concepts/adapters) for alternatives.
+
+## Horizon Sync Issues
+
+### Auth Login Fails
+
+#### Symptom
+
+```bash
+faramesh auth login
+Error: failed to authenticate: connection refused
+```
+
+#### Solution
+
+Check Horizon URL and connectivity:
+
+```bash
+faramesh auth login --horizon-url https://horizon.faramesh.com
+```
+
+Verify network access:
+
+```bash
+curl https://horizon.faramesh.com/health
+```
+
+### Token Expired
+
+#### Symptom
+
+```
+Error: Horizon token expired
+Run: faramesh auth login
+```
+
+#### Solution
+
+Re-authenticate:
+
+```bash
+faramesh auth login
+```
+
+Check token status:
+
+```bash
+faramesh auth status
+```
+
+### Sync Fails but Daemon Continues
+
+#### Symptom
+
+Daemon logs:
+
+```json
+{"level":"warn","msg":"horizon sync failed","error":"timeout"}
+```
+
+#### Solution
+
+**Expected behavior.** Faramesh is **local-first** — it continues operating even if Horizon is unreachable.
+
+Sync will resume automatically when connectivity is restored. Check metrics:
+
+```prometheus
+faramesh_horizon_sync_failures_total
+```
+
+## Performance Issues
+
+### High Latency (P99 >10ms)
+
+#### Symptom
+
+Prometheus metrics:
+
+```prometheus
+histogram_quantile(0.99, rate(faramesh_decision_latency_seconds_bucket[5m])) > 0.01
+```
+
+#### Solution
+
+Possible causes:
+
+1. **Complex policy rules** — Simplify conditions in `match.when`
+2. **Disk I/O bottleneck** — Use SSD for `--data-dir`
+3. **PostgreSQL latency** — Check DB performance, add indexes
+4. **CPU throttling** — Increase CPU limits in Kubernetes
+
+Profile the policy:
+
+```bash
+faramesh policy benchmark policy.yaml --iterations 10000
+```
+
+### High Memory Usage
+
+#### Symptom
+
+```
+OOMKilled: Container killed due to out-of-memory
+```
+
+#### Solution
+
+Increase memory limits:
+
+```yaml
+resources:
+  limits:
+    memory: "512Mi"  # Increase from 128Mi
+```
+
+Check for memory leaks (rare):
+
+```bash
+pprof http://localhost:9108/debug/pprof/heap
+```
+
+## Kubernetes Issues
+
+### Sidecar Not Starting
+
+#### Symptom
+
+```bash
+kubectl logs pod/payment-bot -c faramesh
+Error: failed to load policy: open /etc/faramesh/policy.yaml: no such file or directory
+```
+
+#### Solution
+
+Policy ConfigMap not mounted. Verify:
+
+```bash
+kubectl get configmap faramesh-policy
+kubectl describe pod payment-bot
+```
+
+Add volumeMount:
+
+```yaml
+volumeMounts:
+  - name: policy
+    mountPath: /etc/faramesh
+volumes:
+  - name: policy
+    configMap:
+      name: faramesh-policy
+```
+
+### PersistentVolume Not Bound
+
+#### Symptom
+
+```bash
+kubectl get pvc
+NAME             STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS
+faramesh-data    Pending   -        -          -              fast-ssd
+```
+
+#### Solution
+
+No available PersistentVolume. Check storage class:
+
+```bash
+kubectl get storageclass
+```
+
+Create PV or use dynamic provisioning:
+
+```yaml
+storageClassName: standard  # Use available storage class
+```
+
+### Socket Volume Not Shared
+
+#### Symptom
+
+Agent logs:
+
+```
+Error: dial unix /var/run/faramesh/faramesh.sock: no such file or directory
+```
+
+#### Solution
+
+Agent and daemon must share the same emptyDir volume:
+
+```yaml
+volumes:
+  - name: faramesh-socket
+    emptyDir: {}
+
+containers:
+  - name: agent
+    volumeMounts:
+      - name: faramesh-socket
+        mountPath: /var/run/faramesh
+
+  - name: faramesh
+    volumeMounts:
+      - name: faramesh-socket
+        mountPath: /var/run/faramesh
+```
+
+## Debug Mode
+
+Enable debug logs for detailed diagnostics:
+
+```bash
+faramesh serve --policy policy.yaml --log-level debug
+```
+
+Debug logs include:
+- Policy compilation details
+- Rule evaluation step-by-step
+- WAL write confirmations
+- DPR store queries
+- Adapter connection events
+
+## Getting Help
+
+<CardGroup cols={2}>
+  <Card title="GitHub Discussions" icon="github" href="https://github.com/faramesh/faramesh-core/discussions">
+    Ask questions and share solutions
+  </Card>
+  <Card title="File an Issue" icon="bug" href="https://github.com/faramesh/faramesh-core/issues">
+    Report bugs and request features
+  </Card>
+  <Card title="Slack Community" icon="slack" href="https://faramesh.com/slack">
+    Join the Faramesh community
+  </Card>
+  <Card title="Email Support" icon="envelope" href="mailto:support@faramesh.com">
+    Reach out to the support team
+  </Card>
+</CardGroup>
+
+## Common Error Messages
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| `compile policy: unknown tool` | Policy references undefined tool | Define tool in `tools:` section |
+| `bind: address already in use` | Socket/port already taken | Stop existing daemon or change port |
+| `permission denied` | File/directory permissions | Fix with `chmod`/`chown` |
+| `WAL write failed: disk full` | Out of disk space | Free up space, rotate logs |
+| `chain break detected` | DPR integrity violation | Investigate, restore from backup |
+| `Horizon token expired` | Auth token expired | Run `faramesh auth login` |
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Daemon Guide" icon="server" href="/deployment/daemon">
+    Complete daemon configuration reference
+  </Card>
+  <Card title="Monitoring" icon="chart-line" href="/deployment/monitoring">
+    Metrics and observability setup
+  </Card>
+</CardGroup>

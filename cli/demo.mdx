@@ -1,0 +1,207 @@
+---
+title: 'faramesh demo'
+description: 'Run a synthetic agent demo to see governance in action'
+---
+
+## Overview
+
+`faramesh demo` is the "hello world" of agent governance. It runs a synthetic agent against a pre-loaded policy and streams live authorization decisions to your terminal.
+
+**Zero config. Zero infrastructure. See PERMIT, DENY, and DEFER decisions in under 3 seconds.**
+
+## Usage
+
+```bash
+faramesh demo
+```
+
+## What It Does
+
+1. **Loads a demo policy** — Pre-configured rules covering common governance scenarios
+2. **Simulates 5 tool calls** — Representative actions from different governance classes
+3. **Evaluates each call** — Shows real-time decisions with color-coded effects
+4. **Displays latency** — Sub-millisecond decision times
+
+## Demo Scenarios
+
+The demo evaluates five canonical tool calls:
+
+### 1. Currency Exchange (PERMIT)
+```text
+[15:04:05] PERMIT  get_exchange_rate      from=USD to=SEK              latency=1ms
+```
+Low-risk read operation — allowed by default.
+
+### 2. Shell Command (DENY)
+```text
+[15:04:05] DENY    shell/run              cmd="rm -rf /tmp/build"      policy=deny-destructive-shell  latency=2ms
+```
+Destructive shell command — blocked by policy rule.
+
+### 3. Customer Data Read (PERMIT)
+```text
+[15:04:05] PERMIT  read_customer          id=cust_abc123               latency=1ms
+```
+Read-only customer data access — permitted.
+
+### 4. High-Value Refund (DEFER)
+```text
+[15:04:06] DEFER   stripe/refund          amount=$12,000               awaiting approval  policy=defer-high-value  latency=1ms
+```
+High-value financial operation — requires human approval.
+
+### 5. Bulk Email (DENY)
+```text
+[15:04:06] DENY    send_email             recipients=847               scanner=BULK_OPERATION  latency=2ms
+```
+Bulk operation detected by scanner — blocked.
+
+## Example Output
+
+```bash
+$ faramesh demo
+
+Faramesh — Unified Agent Governance
+Starting synthetic agent with demo policy...
+
+[15:04:05] PERMIT  get_exchange_rate      from=USD to=SEK              latency=1ms
+[15:04:05] DENY    shell/run              cmd="rm -rf /tmp/build"      policy=deny-destructive-shell  latency=2ms
+[15:04:05] PERMIT  read_customer          id=cust_abc123               latency=1ms
+[15:04:06] DEFER   stripe/refund          amount=$12,000               awaiting approval  policy=defer-high-value  latency=1ms
+[15:04:06] DENY    send_email             recipients=847               scanner=BULK_OPERATION  latency=2ms
+
+─────────────────────────────────────────────
+5 actions evaluated. 2 PERMIT  2 DENY  1 DEFER
+
+Start governing your agent:
+  faramesh serve --policy payment.yaml
+
+Auto-detect your environment:
+  faramesh init
+```
+
+## Demo Policy
+
+The demo uses an embedded policy with these rules:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: demo-agent
+default_effect: permit
+
+vars:
+  max_refund: 500
+
+rules:
+  # Deny destructive shell commands
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs"'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+
+  # Require approval for high-value operations
+  - id: defer-high-value
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: high-value operation requires human approval
+    reason_code: HIGH_VALUE_THRESHOLD
+```
+
+## Use Cases
+
+### 1. First-Time Users
+Get a feel for how Faramesh governance works before configuring your environment.
+
+```bash
+# Just run it — no setup required
+faramesh demo
+```
+
+### 2. Sales Demos
+Show governance concepts to stakeholders in under 30 seconds.
+
+```bash
+# Clean output, instant results
+faramesh demo
+```
+
+### 3. Testing Installation
+Verify Faramesh is installed and working correctly.
+
+```bash
+# Should complete in under 3 seconds
+faramesh demo
+```
+
+## Technical Details
+
+### In-Memory Pipeline
+The demo runs entirely in memory — no disk I/O, no sockets, no infrastructure:
+
+- **Policy engine** — Pre-compiled rules
+- **Decision pipeline** — Full evaluation chain
+- **No persistence** — Records discarded after demo
+
+### Performance
+All decisions complete in **1-2ms**, demonstrating Faramesh's sub-millisecond latency.
+
+### No Side Effects
+- No files written
+- No network calls
+- No daemon required
+- Safe to run repeatedly
+
+## Next Steps
+
+After running the demo:
+
+<CardGroup cols={2}>
+  <Card title="Initialize Your Project" icon="terminal" href="/cli/init">
+    Auto-detect your environment and generate configuration
+  </Card>
+  
+  <Card title="Start the Daemon" icon="server" href="/cli/serve">
+    Launch the governance daemon with your policy
+  </Card>
+  
+  <Card title="Write Your Policy" icon="file-code" href="/policies/writing-policies">
+    Learn the Faramesh Policy Language (FPL)
+  </Card>
+  
+  <Card title="Stream Live Decisions" icon="activity" href="/cli/audit">
+    Use `faramesh audit tail` to watch your agent
+  </Card>
+</CardGroup>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Demo completes too fast to read">
+    The demo includes built-in delays between decisions (350ms). If you want to study the output, pipe to `less` or redirect to a file:
+    
+    ```bash
+    faramesh demo | tee demo-output.txt
+    ```
+  </Accordion>
+  
+  <Accordion title="No color output">
+    If running in a CI environment or redirecting output, colors are automatically disabled. To force color output:
+    
+    ```bash
+    FORCE_COLOR=1 faramesh demo
+    ```
+  </Accordion>
+  
+  <Accordion title="Want to modify demo scenarios">
+    The demo scenarios are embedded in the binary. To test custom scenarios, use:
+    
+    ```bash
+    faramesh policy test policy.yaml --tool your/tool --args '{...}'
+    ```
+  </Accordion>
+</AccordionGroup>

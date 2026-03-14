@@ -1,0 +1,207 @@
+---
+title: Running the Daemon
+description: Start and configure the Faramesh governance daemon
+---
+
+## Overview
+
+The Faramesh daemon (`faramesh serve`) is the core governance server that:
+- Loads your policy file and compiles rules
+- Opens the Write-Ahead Log (WAL) and SQLite DPR store
+- Starts the Unix socket server for SDK connections
+- Accepts governance requests from agents and returns PERMIT/DENY/DEFER decisions
+
+<Note>
+The daemon runs as a persistent background process. All agents on the same host connect to it via a Unix socket.
+</Note>
+
+## Basic Usage
+
+Start the daemon with a policy file:
+
+```bash
+faramesh serve --policy policy.yaml
+```
+
+The daemon will:
+1. Load and validate `policy.yaml`
+2. Create data directory at `$TMPDIR/faramesh` (default)
+3. Listen on Unix socket `/tmp/faramesh.sock` (default)
+4. Begin accepting governance requests
+
+## Configuration Flags
+
+### Core Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--policy` | `policy.yaml` | Path to the policy YAML file |
+| `--data-dir` | `$TMPDIR/faramesh` | Directory for WAL and DPR SQLite |
+| `--socket` | `/tmp/faramesh.sock` | Unix socket path for SDK adapter |
+| `--log-level` | `info` | Log level: debug, info, warn, error |
+
+### Adapter Ports
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--proxy-port` | `0` (disabled) | HTTP proxy adapter port |
+| `--grpc-port` | `0` (disabled) | gRPC daemon adapter port |
+| `--mcp-proxy-port` | `0` (disabled) | MCP HTTP gateway port |
+| `--mcp-target` | - | Upstream MCP server URL (required with `--mcp-proxy-port`) |
+
+### Observability
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--metrics-port` | `0` (disabled) | Prometheus metrics endpoint port |
+
+### Integrations
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--slack-webhook` | - | Slack webhook URL for DEFER notifications |
+| `--sync-horizon` | `false` | Stream DPR records to Faramesh Horizon (requires auth) |
+| `--dpr-dsn` | - | PostgreSQL DSN for mirrored DPR writes |
+
+## Production Example
+
+```bash
+faramesh serve \
+  --policy /etc/faramesh/policy.yaml \
+  --data-dir /var/lib/faramesh \
+  --socket /var/run/faramesh.sock \
+  --metrics-port 9108 \
+  --log-level info
+```
+
+See [daemon.go:67-79](https://github.com/faramesh/faramesh-core/blob/main/internal/daemon/daemon.go:67-79) for the full configuration structure.
+
+## Data Directory Structure
+
+The `--data-dir` contains:
+
+```
+/var/lib/faramesh/
+├── faramesh.wal         # Write-Ahead Log (append-only)
+├── faramesh.db          # SQLite DPR store (queryable)
+└── faramesh.pid         # Process ID file
+```
+
+<Warning>
+The WAL is the authoritative audit log. Back it up regularly. The SQLite database is rebuilt from the WAL if corrupted.
+</Warning>
+
+## Unix Socket
+
+Agents connect to the daemon via the Unix socket specified by `--socket`.
+
+**Default:** `/tmp/faramesh.sock`
+
+**SDK Adapter:**
+- Python SDK: `Faramesh(socket_path="/tmp/faramesh.sock")`
+- TypeScript SDK: `new Faramesh({ socketPath: "/tmp/faramesh.sock" })`
+
+See [sdk/server.go:22](https://github.com/faramesh/faramesh-core/blob/main/internal/adapter/sdk/server.go:22) for the SDK server implementation.
+
+## Policy Hot Reload
+
+Reload the policy without restarting the daemon:
+
+```bash
+kill -HUP $(cat /var/lib/faramesh/faramesh.pid)
+```
+
+Or use the CLI:
+
+```bash
+faramesh policy reload --data-dir /var/lib/faramesh
+```
+
+The daemon receives `SIGHUP`, re-reads the policy file, and hot-swaps the engine. If compilation fails, the running policy is untouched.
+
+See [daemon.go:106-142](https://github.com/faramesh/faramesh-core/blob/main/internal/daemon/daemon.go:106-142) for the reload implementation.
+
+## Horizon Sync
+
+Stream DPR records to Faramesh Horizon cloud for centralized governance:
+
+### 1. Authenticate
+
+```bash
+faramesh auth login
+```
+
+### 2. Start with Sync Enabled
+
+```bash
+faramesh serve --policy policy.yaml --sync-horizon
+```
+
+The daemon will:
+- Validate your Horizon token on startup
+- Stream all governance decisions to Horizon in real time
+- Continue operating if Horizon is unreachable (local-first)
+
+See [daemon.go:81-100](https://github.com/faramesh/faramesh-core/blob/main/internal/daemon/daemon.go:81-100) for Horizon sync configuration.
+
+## Graceful Shutdown
+
+The daemon handles `SIGINT` and `SIGTERM` gracefully:
+
+```bash
+kill -TERM $(cat /var/lib/faramesh/faramesh.pid)
+```
+
+On shutdown, the daemon:
+1. Stops accepting new connections
+2. Flushes pending WAL writes
+3. Closes the SQLite store
+4. Flushes Horizon sync buffer (if enabled)
+5. Removes the PID file
+
+See [daemon.go:290-324](https://github.com/faramesh/faramesh-core/blob/main/internal/daemon/daemon.go:290-324) for shutdown logic.
+
+## Troubleshooting
+
+### Daemon won't start
+
+Validate your policy first:
+
+```bash
+faramesh policy validate policy.yaml
+```
+
+Run with debug logs:
+
+```bash
+faramesh serve --policy policy.yaml --log-level debug
+```
+
+### Cannot connect to socket
+
+Verify the daemon is running:
+
+```bash
+ls -l /tmp/faramesh.sock
+```
+
+Check the socket path matches between daemon and SDK:
+
+```bash
+faramesh serve --socket /tmp/faramesh.sock
+```
+
+### Policy reload fails
+
+Check daemon logs for compilation errors. The running policy remains active if reload fails.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Sidecar Deployment" icon="cubes" href="/deployment/sidecar">
+    Deploy Faramesh as a Kubernetes sidecar
+  </Card>
+  <Card title="Production Guide" icon="shield-check" href="/deployment/production">
+    Production deployment and high availability
+  </Card>
+</CardGroup>

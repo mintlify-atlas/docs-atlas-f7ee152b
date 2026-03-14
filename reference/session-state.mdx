@@ -1,0 +1,585 @@
+---
+title: Session State API
+description: Session history, counters, cost tracking, and ring buffer API reference
+---
+
+## Overview
+
+Faramesh policies have access to **session state** — a runtime context that tracks tool call history, costs, and custom counters. Session state enables:
+
+- **Sequence-aware governance** (detect multi-step attack patterns)
+- **Budget enforcement** (track spend across calls)
+- **Rate limiting** (count calls per session)
+- **Behavioral analysis** (detect anomalies in call patterns)
+
+Session state is accessible in policy conditions via the `session.*` namespace.
+
+---
+
+## Session Context
+
+Available in all `when:` expressions:
+
+```yaml
+rules:
+  - id: example-session-access
+    match:
+      tool: "*"
+      when: "session.call_count > 50 || session.cost_usd > 5.00"
+    effect: defer
+```
+
+### session.call_count
+
+<ParamField path="session.call_count" type="integer">
+  Total number of tool calls in this session (all tools).
+  
+  ```yaml
+  when: "session.call_count > 100"
+  ```
+</ParamField>
+
+**Example: Rate Limiting**
+
+```yaml
+rules:
+  - id: defer-high-call-volume
+    match:
+      tool: "*"
+      when: "session.call_count > 500"
+    effect: defer
+    reason: "Session exceeded 500 calls — manual review required"
+    reason_code: RATE_LIMIT_EXCEEDED
+```
+
+---
+
+### session.cost_usd
+
+<ParamField path="session.cost_usd" type="number">
+  Total USD cost accumulated in this session.
+  
+  Tracks costs from tools with `cost_usd` declared in metadata.
+  
+  ```yaml
+  when: "session.cost_usd > 10.00"
+  ```
+</ParamField>
+
+**Example: Budget Warning**
+
+```yaml
+rules:
+  - id: defer-near-budget
+    match:
+      tool: "*"
+      when: "session.cost_usd > 8.00"
+    effect: defer
+    reason: "Session approaching $10 budget limit"
+    reason_code: BUDGET_WARNING
+```
+
+---
+
+### session.daily_cost_usd
+
+<ParamField path="session.daily_cost_usd" type="number">
+  Total USD cost accumulated today (all sessions, persisted).
+  
+  Enables daily budget enforcement across sessions.
+  
+  ```yaml
+  when: "session.daily_cost_usd > 100.00"
+  ```
+</ParamField>
+
+**Example: Daily Budget**
+
+```yaml
+budget:
+  daily_usd: 100.00
+  on_exceed: defer
+
+rules:
+  - id: warn-high-daily-spend
+    match:
+      tool: "*"
+      when: "session.daily_cost_usd > 90.00"
+    effect: defer
+    reason: "Approaching daily budget limit ($100)"
+```
+
+---
+
+### session.history
+
+<ParamField path="session.history" type="array">
+  Array of recent tool calls (newest first).
+  
+  Each entry is an object:
+  ```json
+  {
+    "tool": "stripe/refund",
+    "effect": "PERMIT",
+    "timestamp": 1710417000,
+    "args": { "amount": 50 }
+  }
+  ```
+  
+  Size controlled by `session.history_calls` and `session.history_secs`.
+</ParamField>
+
+**Example: Direct History Access**
+
+```yaml
+rules:
+  - id: check-recent-history
+    match:
+      tool: "delete_*"
+      when: "len(session.history) > 0 && session.history[0].tool == 'http/post'"
+    effect: defer
+    reason: "Delete attempt immediately after HTTP POST"
+```
+
+---
+
+## History Helper Functions
+
+Faramesh provides built-in helpers for querying session history:
+
+### history_contains_within()
+
+<ParamField path="history_contains_within(tool_pattern, seconds)" type="function">
+  Returns `true` if any call matching `tool_pattern` occurred within the last `seconds` seconds.
+  
+  **Parameters:**
+  - `tool_pattern` (string): Glob pattern (`stripe/*`, `http/post`, `*`)
+  - `seconds` (integer): Time window
+  
+  **Returns:** boolean
+  
+  ```yaml
+  when: "history_contains_within('http/post', 120)"
+  ```
+</ParamField>
+
+**Example: Detect Exfiltration Pattern**
+
+```yaml
+rules:
+  - id: defer-delete-after-exfil
+    match:
+      tool: "delete_*"
+      when: "history_contains_within('http/post', 120)"
+    effect: defer
+    reason: "Delete blocked: data sent externally in last 2 minutes"
+    reason_code: SEQUENCE_EXFIL_DETECTED
+    incident_category: data_exfiltration
+    incident_severity: high
+```
+
+---
+
+### history_sequence()
+
+<ParamField path="history_sequence(tool_a, tool_b, ...)" type="function">
+  Returns `true` if the given tools appeared in order (not necessarily contiguous) in session history.
+  
+  **Parameters:**
+  - `tool_a, tool_b, ...` (strings): Tool IDs or patterns in expected order
+  
+  **Returns:** boolean
+  
+  ```yaml
+  when: "history_sequence('read_file', 'http/post', 'delete_file')"
+  ```
+</ParamField>
+
+**Example: Multi-Step Attack Detection**
+
+```yaml
+rules:
+  - id: deny-credential-exfil-sequence
+    match:
+      tool: "http/*"
+      when: "history_sequence('vault/read', 'secrets/get')"
+    effect: deny
+    reason: "Credential access → HTTP outbound sequence blocked"
+    reason_code: SEQUENCE_CREDENTIAL_LEAK
+    incident_category: credential_access
+    incident_severity: critical
+```
+
+---
+
+### history_tool_count()
+
+<ParamField path="history_tool_count(tool_pattern)" type="function">
+  Returns the count of calls matching `tool_pattern` in the current history window.
+  
+  **Parameters:**
+  - `tool_pattern` (string): Glob pattern
+  
+  **Returns:** integer
+  
+  ```yaml
+  when: "history_tool_count('stripe/*') > 5"
+  ```
+</ParamField>
+
+**Example: Rate Anomaly Detection**
+
+```yaml
+rules:
+  - id: defer-stripe-burst
+    match:
+      tool: "stripe/*"
+      when: "history_tool_count('stripe/*') >= 10"
+    effect: defer
+    reason: "Unusual Stripe activity: 10+ calls in session"
+    reason_code: RATE_ANOMALY
+    incident_category: abuse
+```
+
+---
+
+### deny_count_within()
+
+<ParamField path="deny_count_within(seconds)" type="function">
+  Returns the count of DENY outcomes in the last `seconds` seconds.
+  
+  Useful for detecting repeated policy violations.
+  
+  **Parameters:**
+  - `seconds` (integer): Time window
+  
+  **Returns:** integer
+  
+  ```yaml
+  when: "deny_count_within(300) >= 3"
+  ```
+</ParamField>
+
+**Example: Escalate After Repeated Denials**
+
+```yaml
+rules:
+  - id: escalate-repeated-denials
+    match:
+      tool: "*"
+      when: "deny_count_within(600) >= 5"
+    effect: defer
+    reason: "5+ policy denials in last 10 minutes — escalating"
+    reason_code: REPEATED_VIOLATIONS
+    incident_severity: high
+```
+
+---
+
+## History Configuration
+
+Control the size and retention of session history:
+
+```yaml
+session:
+  history_calls: 100     # Retain last 100 calls
+  history_secs: 3600     # Retain calls from last hour
+```
+
+<ParamField path="history_calls" type="integer" default="50">
+  Maximum number of recent calls to retain.
+  
+  ```yaml
+  history_calls: 100
+  ```
+</ParamField>
+
+<ParamField path="history_secs" type="integer" default="3600">
+  Maximum age (in seconds) of calls to retain.
+  
+  ```yaml
+  history_secs: 7200  # 2 hours
+  ```
+</ParamField>
+
+History is pruned using a **ring buffer** that enforces both limits:
+- Calls older than `history_secs` are dropped
+- If more than `history_calls` remain, oldest are dropped
+
+---
+
+## Args Array Helpers
+
+For inspecting array arguments in tool calls:
+
+### args_array_len()
+
+<ParamField path="args_array_len(path)" type="function">
+  Returns the length of an array argument.
+  
+  **Parameters:**
+  - `path` (string): Dot-separated path to array (e.g., `"recipients"`, `"items.products"`)
+  
+  **Returns:** integer
+  
+  ```yaml
+  when: "args_array_len('recipients') > 10"
+  ```
+</ParamField>
+
+**Example: Limit Email Recipients**
+
+```yaml
+rules:
+  - id: defer-mass-email
+    match:
+      tool: "send_email"
+      when: "args_array_len('recipients') > 20"
+    effect: defer
+    reason: "Email to 20+ recipients requires approval"
+```
+
+---
+
+### args_array_contains()
+
+<ParamField path="args_array_contains(path, value)" type="function">
+  Returns `true` if the array contains `value`.
+  
+  **Parameters:**
+  - `path` (string): Path to array
+  - `value` (string): Value to search for
+  
+  **Returns:** boolean
+  
+  ```yaml
+  when: "args_array_contains('recipients', 'ceo@company.com')"
+  ```
+</ParamField>
+
+**Example: VIP Protection**
+
+```yaml
+rules:
+  - id: defer-vip-email
+    match:
+      tool: "send_email"
+      when: "args_array_contains('recipients', 'ceo@company.com')"
+    effect: defer
+    reason: "Emails to CEO require approval"
+```
+
+---
+
+### args_array_any_match()
+
+<ParamField path="args_array_any_match(path, pattern)" type="function">
+  Returns `true` if any array element matches the glob `pattern`.
+  
+  **Parameters:**
+  - `path` (string): Path to array
+  - `pattern` (string): Glob pattern
+  
+  **Returns:** boolean
+  
+  ```yaml
+  when: "args_array_any_match('recipients', '*@external.com')"
+  ```
+</ParamField>
+
+**Example: External Domain Detection**
+
+```yaml
+rules:
+  - id: defer-external-email
+    match:
+      tool: "send_email"
+      when: "args_array_any_match('recipients', '*@external.com')"
+    effect: defer
+    reason: "External email recipients require approval"
+```
+
+---
+
+## Multi-Agent Session State
+
+For orchestrator scenarios with multiple agents sharing state:
+
+```yaml
+session_state_policy:
+  agent_id: "orchestrator"
+  declared_keys:
+    - key: "customer_id"
+      type: "string"
+      max_length: 64
+      scan: ["injection"]
+    
+    - key: "refund_total"
+      type: "number"
+      max_length: 0
+  
+  undeclared_key_policy: "deny"
+  
+  write_scan:
+    injection_detection: true
+    pii_scan: true
+    secret_scan: true
+  
+  read_sanitization:
+    strip_injection_patterns: true
+    max_interpolation_depth: 2
+```
+
+<ParamField path="declared_keys" type="array">
+  Allowed keys in shared session state.
+  
+  Each key declaration:
+  - `key` (string): Key name
+  - `type` (string): Data type (`string`, `number`, `boolean`, `object`)
+  - `max_length` (integer): Maximum value length
+  - `scan` (array): Scans to apply (`injection`, `pii`, `secret`)
+</ParamField>
+
+<ParamField path="undeclared_key_policy" type="string" default="deny">
+  Action for undeclared keys.
+  
+  Valid values: `permit`, `deny`
+</ParamField>
+
+<ParamField path="write_scan" type="object">
+  Scans applied to all session state writes.
+  
+  - `injection_detection` (boolean): Detect injection patterns
+  - `pii_scan` (boolean): Detect PII in values
+  - `secret_scan` (boolean): Detect secrets/credentials
+</ParamField>
+
+<ParamField path="read_sanitization" type="object">
+  Sanitization applied to session state reads.
+  
+  - `strip_injection_patterns` (boolean): Remove injection patterns
+  - `max_interpolation_depth` (integer): Limit nested interpolation
+</ParamField>
+
+---
+
+## Complete Example
+
+```yaml
+faramesh-version: "1.0"
+agent-id: "exfil-monitor"
+
+session:
+  expiry: "2h"
+  history_calls: 200
+  history_secs: 7200
+
+budget:
+  session_usd: 10.00
+  daily_usd: 100.00
+  on_exceed: defer
+
+rules:
+  # SEQUENCE: Read → Exfil → Delete
+  - id: defer-delete-after-exfil
+    match:
+      tool: "delete_*"
+      when: "history_contains_within('http/post', 120)"
+    effect: defer
+    reason: "Delete blocked: HTTP POST in last 2 minutes"
+    reason_code: SEQUENCE_EXFIL_DETECTED
+    incident_category: data_exfiltration
+    incident_severity: high
+  
+  # SEQUENCE: Credential access → Outbound
+  - id: deny-http-after-secrets
+    match:
+      tool: "http/*"
+      when: "history_sequence('vault/read', 'secrets/get')"
+    effect: deny
+    reason: "Credential access → HTTP outbound blocked"
+    reason_code: SEQUENCE_CREDENTIAL_LEAK
+    incident_severity: critical
+  
+  # RATE: Burst detection
+  - id: defer-stripe-burst
+    match:
+      tool: "stripe/*"
+      when: "history_tool_count('stripe/*') >= 10"
+    effect: defer
+    reason: "Stripe burst: 10+ calls in session"
+    reason_code: RATE_ANOMALY
+  
+  # BUDGET: Near limit warning
+  - id: defer-near-budget
+    match:
+      tool: "*"
+      when: "session.cost_usd > 8.00"
+    effect: defer
+    reason: "Approaching $10 session budget"
+  
+  # BEHAVIORAL: Repeated denials
+  - id: escalate-repeated-denials
+    match:
+      tool: "*"
+      when: "deny_count_within(300) >= 3"
+    effect: defer
+    reason: "3+ denials in 5 minutes — escalating"
+    incident_severity: high
+  
+  # ARGS: Mass email protection
+  - id: defer-mass-email
+    match:
+      tool: "send_email"
+      when: "args_array_len('recipients') > 20"
+    effect: defer
+    reason: "Mass email (20+ recipients)"
+  
+  # ARGS: External recipients
+  - id: defer-external-email
+    match:
+      tool: "send_email"
+      when: "args_array_any_match('recipients', '*@external.com')"
+    effect: defer
+    reason: "External email recipients"
+
+default_effect: permit
+```
+
+---
+
+## Best Practices
+
+### History Window Sizing
+- **Short sessions** (minutes): `history_calls: 50`, `history_secs: 1800` (30 min)
+- **Long sessions** (hours): `history_calls: 200`, `history_secs: 7200` (2 hours)
+- **Multi-day sessions**: `history_calls: 500`, `history_secs: 86400` (24 hours)
+
+### Performance
+- History helpers are O(n) where n = history size
+- Keep `history_calls` under 500 for &lt;1ms evaluation
+- Use `history_contains_within()` instead of scanning full `session.history`
+
+### Security
+- Use `history_sequence()` to detect multi-step attacks
+- Combine `deny_count_within()` with incident escalation
+- Track `session.daily_cost_usd` to prevent cost-based DoS
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Policy YAML" icon="file-code" href="/reference/policy-yaml">
+    Complete policy schema reference
+  </Card>
+  <Card title="Rule Effects" icon="gavel" href="/reference/rule-effects">
+    PERMIT, DENY, DEFER, and SHADOW effects
+  </Card>
+  <Card title="Tool Metadata" icon="wrench" href="/reference/tool-metadata">
+    Reversibility and blast radius
+  </Card>
+  <Card title="External Selectors" icon="plug" href="/reference/selectors">
+    Custom operators and data sources
+  </Card>
+</CardGroup>

@@ -1,0 +1,416 @@
+---
+title: MCP Gateway
+description: Run Faramesh as an MCP server to govern Claude Desktop, Cursor, and any MCP client
+---
+
+The **MCP Gateway** adapter (A5) allows Faramesh to act as a transparent governance proxy for MCP (Model Context Protocol) servers. Every tool call from MCP clients like Claude Desktop or Cursor passes through the Faramesh policy engine before reaching the real MCP server.
+
+## Architecture
+
+```
+MCP Client          Faramesh MCP Gateway       Real MCP Server
+(Claude Desktop)    (governance here)          (tools/prompts/resources)
+      │                     │                           │
+      ├──tools/call────────►│                           │
+      │                     ├──evaluate policy          │
+      │                     ├──PERMIT/DENY/DEFER        │
+      │                     ├──tools/call──────────────►│
+      │                     │◄─────────result───────────┤
+      │◄────result──────────┤                           │
+```
+
+The gateway intercepts `tools/call` messages, evaluates them against your policy, and either:
+- **PERMIT**: Forwards to the real MCP server
+- **DENY**: Returns an error to the client (no forwarding)
+- **DEFER**: Returns a "pending approval" response with a token
+
+## Quick Start (stdio)
+
+Wrap any stdio-based MCP server with governance:
+
+<Steps>
+  <Step title="Create a policy">
+    ```yaml mcp-policy.yaml
+    faramesh-version: '1.0'
+    agent-id: claude-desktop
+    default_effect: permit
+
+    rules:
+      - id: deny-destructive-file-ops
+        match:
+          tool: filesystem
+          when: 'args["operation"] matches "(delete|remove|rm)"'
+        effect: deny
+        reason: destructive file operations blocked
+        reason_code: DESTRUCTIVE_FILE_OP
+
+      - id: defer-external-api-calls
+        match:
+          tool: http_request
+          when: 'args["url"] matches "https?://(?!internal\\.)"'
+        effect: defer
+        reason: external API calls require approval
+        reason_code: EXTERNAL_API_CALL
+    ```
+  </Step>
+
+  <Step title="Start the governed MCP server">
+    ```bash
+    faramesh mcp wrap --policy mcp-policy.yaml -- node your-mcp-server.js
+    ```
+  </Step>
+
+  <Step title="Configure your MCP client">
+    Point Claude Desktop (or any MCP client) to use the Faramesh wrapper:
+
+    ```json claude_desktop_config.json
+    {
+      "mcpServers": {
+        "filesystem": {
+          "command": "faramesh",
+          "args": ["mcp", "wrap", "--policy", "/path/to/mcp-policy.yaml", "--", "node", "/path/to/mcp-server.js"]
+        }
+      }
+    }
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  Replace `node your-mcp-server.js` with your actual MCP server command. The gateway works with any stdio-based MCP server (Node.js, Python, Go, etc.).
+</Note>
+
+## HTTP Mode
+
+For MCP-over-HTTP servers, run the gateway as an HTTP proxy:
+
+```bash
+faramesh serve \
+  --policy mcp-policy.yaml \
+  --mcp-proxy-port 8090 \
+  --mcp-target http://localhost:3000
+```
+
+Then configure your MCP client to use `http://localhost:8090` instead of `http://localhost:3000`.
+
+## CLI Reference
+
+### faramesh mcp wrap
+
+Wrap a stdio MCP server with governance:
+
+```bash
+faramesh mcp wrap [flags] -- <mcp-server-command> [args...]
+```
+
+#### Flags
+
+- `--policy <path>`: Path to policy YAML file (default: `policy.yaml`)
+- `--agent-id <id>`: Agent ID for governance (default: `mcp-wrapper`)
+
+#### Examples
+
+```bash
+# Wrap a Node.js MCP server
+faramesh mcp wrap --policy policy.yaml -- node mcp-server.js
+
+# Wrap a Python MCP server
+faramesh mcp wrap --policy policy.yaml -- python mcp_server.py
+
+# Wrap with custom agent ID
+faramesh mcp wrap --policy policy.yaml --agent-id claude-desktop -- node server.js
+```
+
+## Policy for MCP Tools
+
+Write policies that match MCP tool names:
+
+```yaml mcp-policy.yaml
+faramesh-version: '1.0'
+agent-id: claude-desktop
+default_effect: permit
+
+vars:
+  max_file_size_bytes: 10485760  # 10 MB
+  allowed_domains:
+    - "internal.company.com"
+    - "api.company.com"
+
+rules:
+  # Deny large file operations
+  - id: deny-large-files
+    match:
+      tool: filesystem_write
+      when: 'args["size"] > vars["max_file_size_bytes"]'
+    effect: deny
+    reason: file exceeds 10MB size limit
+    reason_code: FILE_TOO_LARGE
+
+  # Deny deletion of system files
+  - id: deny-system-file-delete
+    match:
+      tool: filesystem_delete
+      when: 'args["path"] matches "^/(bin|sbin|usr|etc)"'
+    effect: deny
+    reason: cannot delete system files
+    reason_code: SYSTEM_FILE_PROTECTED
+
+  # Require approval for external HTTP requests
+  - id: defer-external-requests
+    match:
+      tool: http_request
+      when: '!any(vars["allowed_domains"], {args["url"] contains #})'
+    effect: defer
+    reason: external HTTP requests require approval
+    reason_code: EXTERNAL_REQUEST
+
+  # Deny SQL queries with DROP/DELETE/TRUNCATE
+  - id: deny-destructive-sql
+    match:
+      tool: database_query
+      when: 'args["query"] matches "(?i)(drop|delete|truncate)\\s+(table|database)"'
+    effect: deny
+    reason: destructive SQL operations blocked
+    reason_code: DESTRUCTIVE_SQL
+
+  # Shadow mode for new experimental tools
+  - id: shadow-experimental
+    match:
+      tool: experimental_*
+    effect: shadow
+    reason: experimental tool in shadow mode
+```
+
+<Tip>
+  Use `effect: shadow` to observe tool calls without blocking them. Shadow mode executes the tool but logs a "would-be" decision for policy testing.
+</Tip>
+
+## Claude Desktop Integration
+
+Integrate with Claude Desktop by editing its MCP configuration:
+
+<Steps>
+  <Step title="Locate Claude Desktop config">
+    - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+    - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+    - **Linux**: `~/.config/Claude/claude_desktop_config.json`
+  </Step>
+
+  <Step title="Add governed MCP servers">
+    ```json claude_desktop_config.json
+    {
+      "mcpServers": {
+        "filesystem": {
+          "command": "faramesh",
+          "args": [
+            "mcp", "wrap",
+            "--policy", "/Users/you/faramesh/mcp-policy.yaml",
+            "--agent-id", "claude-filesystem",
+            "--",
+            "npx", "-y", "@modelcontextprotocol/server-filesystem",
+            "/Users/you/workspace"
+          ]
+        },
+        "github": {
+          "command": "faramesh",
+          "args": [
+            "mcp", "wrap",
+            "--policy", "/Users/you/faramesh/mcp-policy.yaml",
+            "--agent-id", "claude-github",
+            "--",
+            "npx", "-y", "@modelcontextprotocol/server-github"
+          ],
+          "env": {
+            "GITHUB_TOKEN": "ghp_your_token_here"
+          }
+        }
+      }
+    }
+    ```
+  </Step>
+
+  <Step title="Restart Claude Desktop">
+    Restart Claude Desktop to apply the new configuration. All MCP tool calls now pass through Faramesh.
+  </Step>
+</Steps>
+
+## Cursor Integration
+
+Cursor also supports MCP. Add Faramesh to your Cursor MCP config:
+
+```json .cursor/mcp.json
+{
+  "mcpServers": {
+    "codebase-tools": {
+      "command": "faramesh",
+      "args": [
+        "mcp", "wrap",
+        "--policy", "${workspaceFolder}/faramesh/policy.yaml",
+        "--",
+        "node", "${workspaceFolder}/tools/mcp-server.js"
+      ]
+    }
+  }
+}
+```
+
+## DEFER Workflow with MCP
+
+When a tool call is deferred, the MCP client receives a JSON-RPC response with:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "status": "pending_approval",
+    "defer_token": "abc123def456",
+    "reason": "external HTTP requests require approval",
+    "message": "Tool call requires human approval. Token: abc123def456"
+  }
+}
+```
+
+Approve the deferred action from the CLI:
+
+```bash
+faramesh agent approve abc123def456
+```
+
+Deny it:
+
+```bash
+faramesh agent deny abc123def456
+```
+
+<Warning>
+  The MCP client does not automatically retry deferred tool calls. The user must re-issue the request after approval.
+</Warning>
+
+## Observability
+
+Monitor MCP tool calls in real-time:
+
+```bash
+faramesh audit tail
+
+# Output:
+# [10:00:15] PERMIT  filesystem_read    path="/workspace/code.py"     latency=5ms
+# [10:00:17] DENY    filesystem_delete  path="/etc/passwd"             policy=deny-system-file-delete  latency=2ms
+# [10:00:20] DEFER   http_request       url="https://api.stripe.com"  awaiting approval  token=abc123
+```
+
+Each MCP tool call is logged with:
+- Tool name
+- Arguments (structural signature, not raw values)
+- Decision (PERMIT/DENY/DEFER/SHADOW)
+- Latency
+- Rule ID
+
+## Advanced Configuration
+
+### Custom Socket Path
+
+Run the daemon on a custom socket:
+
+```bash
+# Start daemon
+faramesh serve --policy policy.yaml --socket /var/run/faramesh.sock
+
+# Use custom socket in MCP wrapper
+faramesh mcp wrap --socket /var/run/faramesh.sock -- node server.js
+```
+
+### Multiple MCP Servers
+
+Governance works with multiple MCP servers simultaneously:
+
+```json claude_desktop_config.json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "faramesh",
+      "args": ["mcp", "wrap", "--policy", "policy.yaml", "--", "npx", "@mcp/server-filesystem"]
+    },
+    "github": {
+      "command": "faramesh",
+      "args": ["mcp", "wrap", "--policy", "policy.yaml", "--", "npx", "@mcp/server-github"]
+    },
+    "database": {
+      "command": "faramesh",
+      "args": ["mcp", "wrap", "--policy", "policy.yaml", "--", "python", "db_server.py"]
+    }
+  }
+}
+```
+
+All servers share the same policy and audit trail.
+
+### Environment Variables
+
+Pass environment variables to the wrapped MCP server:
+
+```bash
+export GITHUB_TOKEN=ghp_your_token
+export DATABASE_URL=postgres://localhost/db
+
+faramesh mcp wrap --policy policy.yaml -- node server.js
+# Environment variables are inherited by the MCP server subprocess
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="MCP client cannot connect to server">
+    Check that the Faramesh daemon is running:
+    ```bash
+    ps aux | grep faramesh
+    ```
+
+    Check the MCP wrapper logs:
+    ```bash
+    faramesh mcp wrap --policy policy.yaml -- node server.js 2>&1 | tee mcp.log
+    ```
+  </Accordion>
+
+  <Accordion title="Tool calls are not governed">
+    Verify the policy is loaded:
+    ```bash
+    faramesh policy inspect policy.yaml
+    ```
+
+    Check the audit log to see if decisions are recorded:
+    ```bash
+    faramesh audit tail
+    ```
+  </Accordion>
+
+  <Accordion title="DEFER tokens not working">
+    Check the defer status:
+    ```bash
+    faramesh agent status <defer-token>
+    ```
+
+    Approve manually:
+    ```bash
+    faramesh agent approve <defer-token>
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Policy Language" icon="file-lines" href="/concepts/policy-engine">
+    Write advanced policy rules for MCP tools
+  </Card>
+  <Card title="DEFER Workflow" icon="user-check" href="/concepts/defer-workflow">
+    Configure human-in-the-loop approvals
+  </Card>
+  <Card title="Audit Trail" icon="list" href="/concepts/dpr-chain">
+    Verify the integrity of your DPR chain
+  </Card>
+  <Card title="Python SDK" icon="python" href="/guides/python-sdk">
+    Use the Python SDK for non-MCP agents
+  </Card>
+</CardGroup>

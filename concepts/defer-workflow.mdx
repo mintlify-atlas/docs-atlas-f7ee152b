@@ -1,0 +1,379 @@
+---
+title: DEFER Workflow
+description: Human-in-the-loop governance — park, poll, approve/deny with 5-minute timeout
+---
+
+## What is DEFER?
+
+DEFER is Faramesh's human-in-the-loop mechanism. When a policy rule returns `effect: defer`, the tool call is **suspended** until a human approves or denies it.
+
+```yaml
+- id: defer-high-value-refund
+  match:
+    tool: stripe/refund
+    when: 'args["amount"] > 500'
+  effect: defer
+  reason: refund exceeds threshold — requires finance approval
+```
+
+When this rule matches:
+
+1. The pipeline generates a **defer token**
+2. The SDK blocks (or HTTP returns 202 Accepted)
+3. A notification is sent (Slack, terminal, webhook)
+4. An operator runs `faramesh agent approve <token>`
+5. The SDK unblocks and the tool executes
+
+## Architecture
+
+Implemented in `internal/core/defer/workflow.go`:
+
+```go defer/workflow.go
+type Workflow struct {
+    mu       sync.Mutex
+    pending  map[string]*Handle
+    resolved map[string]*resolvedHandle
+    slackURL string
+}
+
+type Handle struct {
+    Token     string
+    AgentID   string
+    ToolID    string
+    Reason    string
+    CreatedAt time.Time
+    Deadline  time.Time          // Default: CreatedAt + 5 minutes
+    ch        chan Resolution    // Signaling channel
+}
+
+type Resolution struct {
+    Approved     bool
+    Reason       string
+    Status       DeferStatus
+    ModifiedArgs map[string]any  // Conditional approval
+}
+```
+
+## The Poll Loop (SDK Adapter)
+
+When a DEFER decision is returned, the SDK blocks in a poll loop:
+
+```python
+# Python SDK (pseudocode)
+def governed_refund(amount, currency):
+    decision = pipeline.evaluate({
+        "tool_id": "stripe/refund",
+        "args": {"amount": amount, "currency": currency}
+    })
+
+    if decision.effect == "DEFER":
+        # Poll for approval
+        while True:
+            status = workflow.status(decision.defer_token)
+            if status == "approved":
+                break
+            elif status in ["denied", "expired"]:
+                raise DeferredError("Action was not approved")
+            time.sleep(2)  # Poll every 2 seconds
+
+    if decision.effect == "PERMIT":
+        return stripe_refund_impl(amount, currency)
+    else:
+        raise DenyError(decision.reason)
+```
+
+## Approval Flow
+
+### Step 1: DEFER Decision
+
+From `internal/core/pipeline.go`:
+
+```go pipeline.go:276
+case "defer", "abstain", "pending":
+    reason := result.Reason
+    if reason == "" {
+        reason = "action requires human approval"
+    }
+    // Generate deterministic token from call ID
+    token := fmt.Sprintf("%x", sha256.Sum256([]byte(req.CallID+req.ToolID)))[:8]
+    // Register with the DEFER workflow exactly once.
+    handle, err := p.defers.DeferWithToken(token, req.AgentID, req.ToolID, reason)
+    if err != nil || handle == nil {
+        // If a handle with this token already exists, reuse the token.
+        _ = handle
+    }
+    d = Decision{
+        Effect:        EffectDefer,
+        RuleID:        result.RuleID,
+        ReasonCode:    result.ReasonCode,
+        Reason:        reason,
+        DeferToken:    token,
+        PolicyVersion: p.engine.Get().Version(),
+    }
+```
+
+### Step 2: Notification
+
+If a Slack webhook URL is configured, the workflow sends a notification:
+
+```go defer/workflow.go:231
+func (w *Workflow) notifySlack(h *Handle) {
+    msg := map[string]any{
+        "text": fmt.Sprintf(
+            "*Faramesh DEFER* | Agent: `%s` | Tool: `%s`\n>%s\n\nToken: `%s` | Expires: %s\n\nApprove: `faramesh agent approve %s`\nDeny:    `faramesh agent deny %s`",
+            h.AgentID, h.ToolID, h.Reason, h.Token,
+            h.Deadline.Format("15:04:05"),
+            h.Token, h.Token,
+        ),
+    }
+    body, _ := json.Marshal(msg)
+    http.Post(w.slackURL, "application/json", bytes.NewReader(body))
+}
+```
+
+Slack message:
+
+```
+Faramesh DEFER | Agent: payment-bot | Tool: stripe/refund
+> refund exceeds threshold — requires finance approval
+
+Token: a1b2c3d4 | Expires: 10:05:23
+
+Approve: faramesh agent approve a1b2c3d4
+Deny:    faramesh agent deny a1b2c3d4
+```
+
+### Step 3: Approval/Denial
+
+```bash
+# Approve
+faramesh agent approve a1b2c3d4
+
+# Deny
+faramesh agent deny a1b2c3d4
+
+# Approve with modified arguments (conditional approval)
+faramesh agent approve a1b2c3d4 --modify '{"amount": 400}'
+```
+
+Implementation:
+
+```go defer/workflow.go:130
+func (w *Workflow) Resolve(token string, approved bool, reason string) error {
+    w.mu.Lock()
+    h, ok := w.pending[token]
+    if ok {
+        delete(w.pending, token)
+    }
+    w.mu.Unlock()
+
+    if !ok {
+        return fmt.Errorf("unknown or already-resolved defer token %q", token)
+    }
+
+    status := StatusDenied
+    if approved {
+        status = StatusApproved
+    }
+    res := Resolution{Approved: approved, Reason: reason, Status: status}
+
+    w.mu.Lock()
+    w.resolved[token] = &resolvedHandle{resolution: res}
+    w.mu.Unlock()
+
+    // Signal the waiting SDK
+    select {
+    case h.ch <- res:
+        return nil
+    default:
+        return fmt.Errorf("defer token %q already resolved", token)
+    }
+}
+```
+
+### Step 4: SDK Unblocks
+
+The SDK's poll loop receives the resolution:
+
+```go
+func Wait(h *Handle) (Resolution, bool) {
+    r := <-h.ch  // Blocks until resolved or expired
+    return r, r.Status == StatusApproved
+}
+```
+
+## Timeout and Expiry
+
+Default timeout: **5 minutes**. Configurable per-rule:
+
+```yaml
+- id: defer-critical-action
+  match:
+    tool: drop_database
+  effect: defer
+  reason: requires DBA approval
+  defer_timeout: 600  # 10 minutes
+```
+
+Expiry goroutine from `defer/workflow.go`:
+
+```go defer/workflow.go:97
+go func() {
+    select {
+    case <-time.After(time.Until(h.Deadline)):
+        res := Resolution{Approved: false, Reason: "expired", Status: StatusExpired}
+        w.mu.Lock()
+        delete(w.pending, token)
+        w.resolved[token] = &resolvedHandle{resolution: res}
+        w.mu.Unlock()
+        select {
+        case h.ch <- res:
+        default:
+        }
+    case <-h.ch:
+    }
+}()
+```
+
+When a DEFER expires, the SDK raises:
+
+```python
+except DeferredError as e:
+    if e.expired:
+        print("Action timed out waiting for approval")
+```
+
+## Conditional Approval
+
+Operators can approve with modified arguments:
+
+```bash
+# Original: refund $600 → DEFER
+# Operator approves with reduced amount:
+faramesh agent approve a1b2c3d4 --modify '{"amount": 500}'
+```
+
+The modified args are **re-validated** against the policy before execution.
+
+```go defer/workflow.go:162
+func (w *Workflow) ResolveWithModifiedArgs(token string, reason string, modifiedArgs map[string]any) error {
+    // ...
+    res := Resolution{
+        Approved:     true,
+        Reason:       reason,
+        Status:       StatusApproved,
+        ModifiedArgs: modifiedArgs,  // ← SDK re-submits with these args
+    }
+    // ...
+}
+```
+
+## DEFER Priority Tiers
+
+Configure SLA and routing per priority level:
+
+```yaml
+defer_priority:
+  critical:
+    criteria: 'tool.blast_radius == "external" && tool.reversibility == "irreversible"'
+    sla_seconds: 300
+    channel: pagerduty
+    escalation_after_seconds: 120
+    auto_deny_after_seconds: 600
+
+  high:
+    criteria: 'args["amount"] > 1000'
+    sla_seconds: 600
+    channel: slack
+
+  normal:
+    criteria: '*'
+    sla_seconds: 1800
+    channel: email
+```
+
+## Batch Approval
+
+Approve multiple pending DEFERs at once:
+
+```bash
+# List all pending DEFERs
+faramesh agent pending
+
+# Approve all for agent payment-bot
+faramesh agent approve --agent payment-bot --all
+
+# Approve all matching a pattern
+faramesh agent approve --tool 'stripe/*' --all
+```
+
+## Notification Channels
+
+Supported backends in `internal/core/defer/backends/`:
+
+- **Slack** — Webhook URL
+- **PagerDuty** — Integration key
+- **Email** — SMTP config
+- **Webhook** — Generic HTTP POST
+- **Terminal** — Print to stdout (dev mode)
+
+Configuration:
+
+```yaml config.yaml
+defer:
+  notification_backends:
+    - type: slack
+      webhook_url: https://hooks.slack.com/services/...
+    - type: pagerduty
+      integration_key: ...
+    - type: webhook
+      url: https://approval.company.com/hook
+      secret: hmac_secret_key
+```
+
+## DEFER in Production
+
+<Tip>
+**Best Practice**: Use DEFER for **boundary-crossing actions** where human judgment is required:
+
+- Financial operations above a threshold
+- Shell commands in production
+- External API calls outside an allowlist
+- Irreversible data operations
+</Tip>
+
+DEFER adds ~2-5 minutes of latency. For latency-sensitive workflows, use `effect: deny` with escalation.
+
+## Metrics and Observability
+
+```bash
+# Show DEFER metrics
+faramesh metrics defer
+
+# Average DEFER resolution time
+# Expired DEFERs (auto-deny)
+# Approval rate by rule ID
+```
+
+Exposed via OpenTelemetry:
+
+```go
+observe.Default.RecordDeferResolution(token, approved, latency)
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Policy Engine" icon="gavel" href="/concepts/policy-engine">
+    Write rules with effect: defer
+  </Card>
+  <Card title="Multi-Agent" icon="users" href="/concepts/multi-agent">
+    DEFER in orchestrator scenarios
+  </Card>
+  <Card title="Webhooks" icon="webhook" href="/deployment/monitoring">
+    Configure custom notification endpoints
+  </Card>
+  <Card title="Slack Integration" icon="slack" href="/cli/agent">
+    Set up Slack approval workflow
+  </Card>
+</CardGroup>

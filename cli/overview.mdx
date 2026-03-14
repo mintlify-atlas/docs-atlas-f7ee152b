@@ -1,0 +1,204 @@
+---
+title: 'CLI Overview'
+description: 'Command-line interface for Faramesh governance'
+---
+
+## Introduction
+
+The Faramesh CLI is a unified command-line tool for managing AI agent governance across every environment. One binary, one policy language, one audit trail.
+
+## Installation
+
+```bash
+# Download the latest binary
+curl -fsSL https://install.faramesh.io | sh
+
+# Or using Go
+go install github.com/faramesh/faramesh-core/cmd/faramesh@latest
+```
+
+## Quick Start
+
+```bash
+# See governance in action (zero config)
+faramesh demo
+
+# Auto-detect your environment and generate config
+faramesh init
+
+# Start the governance daemon
+faramesh serve --policy policy.yaml
+
+# Stream live governance decisions
+faramesh audit tail
+
+# Validate a policy file
+faramesh policy validate policy.yaml
+```
+
+## Command Structure
+
+Faramesh CLI is organized into command groups:
+
+### Core Commands
+
+- **`demo`** — Run a synthetic demo to see governance in action
+- **`init`** — Auto-detect environment and generate configuration
+- **`serve`** — Start the governance daemon
+
+### Policy Management
+
+- **`policy validate`** — Validate a policy file
+- **`policy inspect`** — Show compiled policy summary
+- **`policy test`** — Test a tool call against a policy
+- **`policy diff`** — Compare two policy versions
+- **`policy reload`** — Hot-reload policy in running daemon
+- **`policy replay`** — Replay historical decisions to predict drift
+- **`policy debug`** — Step-through rule evaluation trace
+- **`policy cover`** — Analyze policy coverage gaps
+
+### Audit Trail
+
+- **`audit tail`** — Stream live governance decisions
+- **`audit verify`** — Verify DPR chain integrity
+- **`audit export`** — Export records for compliance (JSON, CSV, JSONL)
+- **`audit stats`** — Show aggregate statistics
+
+### Fleet Management
+
+- **`agent approve`** — Approve a pending DEFER action
+- **`agent deny`** — Deny a pending DEFER action
+- **`agent kill`** — Activate kill switch for an agent
+
+### Authentication
+
+- **`auth login`** — Authenticate with Faramesh Horizon
+- **`auth logout`** — Remove stored credentials
+- **`auth status`** — Show authentication status
+
+## Global Flags
+
+All commands support standard flags:
+
+<ParamField path="--help" type="boolean">
+  Show help for any command
+</ParamField>
+
+<ParamField path="--version" type="boolean">
+  Show Faramesh version
+</ParamField>
+
+## Common Patterns
+
+### Development Workflow
+
+```bash
+# 1. Write your policy
+vim policy.yaml
+
+# 2. Validate it
+faramesh policy validate policy.yaml
+
+# 3. Test specific tool calls
+faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":500}'
+
+# 4. Start daemon in one terminal
+faramesh serve --policy policy.yaml
+
+# 5. Stream decisions in another
+faramesh audit tail
+```
+
+### CI/CD Integration
+
+```bash
+# Validate policy in CI
+faramesh policy validate policy.yaml || exit 1
+
+# Check coverage
+faramesh policy cover policy.yaml || exit 1
+
+# Verify audit trail integrity
+faramesh audit verify /var/lib/faramesh/dpr.db || exit 1
+```
+
+### Production Deployment
+
+```bash
+# Compare policy versions before deployment
+faramesh policy diff policies/v1.yaml policies/v2.yaml
+
+# Predict impact on historical decisions
+faramesh policy replay policies/v2.yaml data/dpr.db
+
+# Hot-reload policy without restarting daemon
+faramesh policy reload
+```
+
+### Compliance Exports
+
+```bash
+# Export decisions for SOC2/HIPAA auditing
+faramesh audit export data/dpr.db --format csv > audit.csv
+
+# Filter by agent and time range
+faramesh audit export data/dpr.db \
+  --agent payment-bot \
+  --since 2024-01-01 \
+  --format json > january-audit.json
+
+# Verify chain integrity during export
+faramesh audit export data/dpr.db --verify --format jsonl
+```
+
+## Environment Variables
+
+<ParamField path="FARAMESH_POLICY" type="string">
+  Default policy file path (overridden by `--policy` flag)
+</ParamField>
+
+<ParamField path="FARAMESH_SOCKET" type="string">
+  Unix socket path for daemon communication (default: `/tmp/faramesh.sock`)
+</ParamField>
+
+<ParamField path="FARAMESH_DATA_DIR" type="string">
+  Directory for WAL and DPR storage (default: `$TMPDIR/faramesh`)
+</ParamField>
+
+<ParamField path="FARAMESH_HORIZON_URL" type="string">
+  Horizon API URL for self-hosted deployments
+</ParamField>
+
+## Exit Codes
+
+Faramesh CLI follows standard POSIX exit codes:
+
+- **0** — Success
+- **1** — General error (invalid policy, validation failure, etc.)
+- **2** — Usage error (missing required arguments, etc.)
+
+## Terminal Output
+
+Decisions are color-coded for clarity:
+
+- **<span style={{color: 'green'}}>PERMIT</span>** — Green (action allowed)
+- **<span style={{color: 'red'}}>DENY</span>** — Red (action blocked)
+- **<span style={{color: 'yellow'}}>DEFER</span>** — Yellow (awaiting human approval)
+- **SHADOW** — Dim gray (observation mode)
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Run the Demo" icon="rocket" href="/cli/demo">
+    See governance in action with zero configuration
+  </Card>
+  <Card title="Initialize Your Environment" icon="terminal" href="/cli/init">
+    Auto-detect environment and generate config
+  </Card>
+  <Card title="Start the Daemon" icon="server" href="/cli/serve">
+    Launch the governance daemon
+  </Card>
+  <Card title="Policy Commands" icon="shield" href="/cli/policy">
+    Validate, test, and manage policies
+  </Card>
+</CardGroup>

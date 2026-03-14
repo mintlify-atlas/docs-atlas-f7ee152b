@@ -1,0 +1,349 @@
+---
+title: 'Compliance Exports'
+description: 'SOC 2, HIPAA, PCI-DSS, and EU AI Act compliance reporting'
+---
+
+## Overview
+
+Faramesh provides **compliance-ready audit trails** for regulated industries. The DPR chain serves as evidence of active governance, and the export commands generate reports in formats required by auditors (JSON, CSV, JSONL).
+
+## Supported Compliance Frameworks
+
+### SOC 2 (System and Organization Controls)
+
+**Relevant Trust Service Criteria**:
+
+- **CC6.1 (Logical Access)**: Faramesh provides audit trails of all access decisions (PERMIT/DENY), including:
+  - User identity (`principal_id_hash`)
+  - Action attempted (`tool_id`)
+  - Decision outcome (`effect`)
+  - Policy rule applied (`matched_rule_id`)
+
+- **CC7.2 (System Monitoring)**: Real-time audit stream (`faramesh audit tail`) enables continuous monitoring of agent actions
+
+- **CC7.3 (Incident Management)**: DPR records include incident classification:
+  ```json
+  {
+    "incident_category": "destructive_command",
+    "incident_severity": "critical",
+    "denial_token": "dnl_a1b2c3d4"  // operator lookup
+  }
+  ```
+
+**Export for SOC 2 Auditors**:
+```bash
+# Full audit trail for the reporting period (e.g., 2024)
+faramesh audit export data/dpr.db \
+  --since 2024-01-01 \
+  --format csv \
+  --verify > soc2-2024-audit-trail.csv
+```
+
+Provide to auditors:
+- `soc2-2024-audit-trail.csv` — All governance decisions
+- Policy files (version-controlled YAML) — Evidence of documented controls
+- Chain verification report — Proof of tamper-evident audit log
+
+### HIPAA (Health Insurance Portability and Accountability Accountability Act)
+
+**Relevant Safeguards**:
+
+- **§164.308(a)(1)(ii)(D) — Information System Activity Review**: Faramesh audit trail satisfies the requirement to "regularly review records of information system activity"
+
+- **§164.312(b) — Audit Controls**: DPR records provide "hardware, software, and/or procedural mechanisms that record and examine activity in information systems that contain or use electronic protected health information"
+
+- **§164.308(a)(5)(ii)(C) — Log-in Monitoring**: Track which agents accessed PHI:
+  ```bash
+  faramesh audit export data/dpr.db \
+    --agent healthcare-bot \
+    --format jsonl | jq 'select(.tool_id | contains("read_patient"))'
+  ```
+
+**HIPAA-Specific Features**:
+
+1. **Pseudonymized User IDs**: `principal_id_hash` is HMAC-hashed, not plaintext (satisfies minimum necessary rule)
+2. **No PHI in Audit Logs**: `args_structural_sig` stores only argument *shape*, never values
+3. **Immutable Audit Trail**: Tamper-evident chain satisfies integrity requirements
+
+**Export for HIPAA Auditors**:
+```bash
+# All PHI access attempts (PERMIT + DENY)
+faramesh audit export data/dpr.db \
+  --format csv \
+  --since 2024-01-01 > hipaa-2024-access-log.csv
+
+# Denied access attempts (potential unauthorized access)
+faramesh audit export data/dpr.db \
+  --effect DENY \
+  --format csv > hipaa-2024-denied-access.csv
+```
+
+<Warning>
+**Retention Requirement**: HIPAA requires 6-year retention of audit logs. Use Faramesh Cloud Platform or export to long-term storage (S3 with Glacier).
+</Warning>
+
+### PCI-DSS (Payment Card Industry Data Security Standard)
+
+**Relevant Requirements**:
+
+- **Requirement 10.2 — Audit Trail**: PCI-DSS requires logging of:
+  - ✅ All access to cardholder data (`tool_id`, `agent_id`)
+  - ✅ Actions taken by individuals with root privileges (`principal.role`)
+  - ✅ Access to audit trails (Faramesh logs all `faramesh audit` CLI invocations)
+  - ✅ Invalid logical access attempts (`effect: DENY`)
+
+- **Requirement 10.3 — Audit Trail Entries**: Each DPR record includes:
+  - ✅ User identification (`principal_id_hash`)
+  - ✅ Type of event (`tool_id`, `effect`)
+  - ✅ Date and time (`created_at`)
+  - ✅ Success or failure (`effect: PERMIT | DENY`)
+  - ✅ Origination of event (`intercept_adapter`, `session_id`)
+  - ✅ Identity of affected resource (`tool_id`)
+
+**Export for PCI-DSS Auditors**:
+```bash
+# All payment-related actions (Requirement 10.2.1)
+faramesh audit export data/dpr.db \
+  --format csv \
+  --since 2024-01-01 | grep -E 'stripe|payment|charge|refund' > pci-2024-payment-access.csv
+
+# Failed access attempts (Requirement 10.2.4)
+faramesh audit export data/dpr.db \
+  --effect DENY \
+  --format csv > pci-2024-failed-access.csv
+```
+
+### EU AI Act (Artificial Intelligence Act)
+
+**Relevant Requirements** (for High-Risk AI Systems):
+
+- **Article 12 — Record-Keeping**: High-risk AI systems must enable "automatic recording of events ('logs') over the lifetime of the system"
+
+- **Article 13 — Transparency**: Logs must be "appropriate to the intended purpose of the system" and include:
+  - ✅ Timestamp (`created_at`)
+  - ✅ Input data characteristics (`args_structural_sig`)
+  - ✅ Decision made by the system (`effect`, `matched_rule_id`)
+  - ✅ Human oversight actions (`DEFER` approvals)
+
+- **Article 14 — Human Oversight**: The DEFER workflow provides evidence of "effective human oversight" — high-risk decisions are parked and require human approval
+
+**Export for EU AI Act Compliance**:
+```bash
+# All decisions with human oversight (DEFER workflow)
+faramesh audit export data/dpr.db \
+  --effect DEFER \
+  --format json > eu-ai-act-human-oversight.json
+
+# Full audit trail for high-risk AI system
+faramesh audit export data/dpr.db \
+  --agent risk-assessment-bot \
+  --verify \
+  --format jsonl > eu-ai-act-audit-log.jsonl
+```
+
+**Chain Verification Report**:
+```bash
+faramesh audit verify data/dpr.db > eu-ai-act-integrity-report.txt
+```
+
+Provide to regulators:
+- `eu-ai-act-audit-log.jsonl` — Complete decision log
+- `eu-ai-act-integrity-report.txt` — Proof of tamper-evident logging
+- Policy files — Evidence of documented governance rules
+
+## Faramesh Cloud Platform (Enterprise)
+
+The **OSS Core** (this repository) provides all compliance export functionality. The **Faramesh Cloud Platform** (Enterprise plan) adds:
+
+### 1. Compliance Dashboard
+
+- **Pre-built reports**: SOC 2, HIPAA, PCI-DSS, EU AI Act templates
+- **Continuous compliance monitoring**: Real-time violations dashboard
+- **Audit-ready exports**: One-click report generation for auditors
+
+### 2. Long-Term Retention
+
+- **7-year retention**: Automatic archival to S3/GCS with Glacier storage
+- **Immutable storage**: Object versioning + legal hold prevents deletion
+- **Cross-region replication**: Disaster recovery and geo-redundancy
+
+### 3. Multi-Tenant Isolation
+
+- **Per-organization audit chains**: Separate DPR databases per customer
+- **Role-based access control**: Limit auditor access to specific agents/time ranges
+- **HMAC signatures**: Non-repudiation for multi-tenant SaaS deployments
+
+### 4. Automated Compliance Checks
+
+- **Policy drift detection**: Alert when production policies diverge from approved versions
+- **Incomplete audit detection**: Flag gaps in the DPR chain (e.g., daemon downtime)
+- **Anomaly detection**: ML-based alerting on unusual DENY spikes
+
+See [Faramesh Cloud Docs](https://faramesh.dev/docs/cloud) for Enterprise features.
+
+## Compliance Checklist
+
+### Pre-Audit Preparation
+
+- [ ] **Export audit trail** for the reporting period (JSON, CSV, JSONL)
+- [ ] **Verify chain integrity**: Run `faramesh audit verify` and save the report
+- [ ] **Collect policy files**: Export policy YAML files and version control history
+- [ ] **Document architecture**: Diagram showing Faramesh integration (adapters, storage, network)
+- [ ] **Retention evidence**: Prove logs are backed up and retained per regulatory requirements
+
+### Common Auditor Questions
+
+**Q: How do you ensure audit logs are tamper-proof?**  
+A: DPR records are cryptographically linked (SHA256 chain). Any modification breaks the chain, detected by `faramesh audit verify`. We provide the verification report.
+
+**Q: Can records be deleted without detection?**  
+A: Deleting a record breaks the chain link. However, if the entire database is deleted, detection requires off-system replication (Faramesh Cloud Platform).
+
+**Q: How long are logs retained?**  
+A: [Your retention policy]. For regulated industries, we recommend 6-7 years (HIPAA/SOC 2 requirement). OSS: manual export to S3. Enterprise: automatic archival.
+
+**Q: Who has access to audit logs?**  
+A: [Your RBAC policy]. Faramesh itself does not enforce access control on the SQLite database — use filesystem ACLs or PostgreSQL roles. Cloud Platform: role-based access control.
+
+**Q: Are PII/PHI values stored in audit logs?**  
+A: No. DPR records store only argument *shapes* (`args_structural_sig`), not values. User IDs are HMAC-hashed. Raw values exist only in the local WAL (access-controlled).
+
+**Q: How do you handle log storage failures?**  
+A: If the WAL write fails (disk full, I/O error), Faramesh returns DENY and blocks execution. See [WAL Ordering Invariant](/security/wal-invariant).
+
+## Export Best Practices
+
+### 1. Verify Before Export
+
+Always run `--verify` to detect tampering:
+```bash
+faramesh audit export data/dpr.db --verify --format json > audit.json
+```
+
+If verification fails, **do not** provide the export to auditors. Investigate the chain break first.
+
+### 2. Filter Sensitive Data
+
+DPR records are privacy-preserving by design, but you can filter further:
+
+```bash
+# Remove internal fields for external auditors
+faramesh audit export data/dpr.db --format jsonl | \
+  jq 'del(.selector_snapshot, .operator_results)' > audit-external.jsonl
+```
+
+### 3. Sign Exports
+
+Provide cryptographic proof that the export was generated by your Faramesh instance:
+
+```bash
+faramesh audit export data/dpr.db --format json > audit.json
+shasum -a 256 audit.json > audit.json.sha256
+gpg --sign audit.json.sha256  # Sign with your org's GPG key
+```
+
+Provide auditors:
+- `audit.json`
+- `audit.json.sha256`
+- `audit.json.sha256.asc` (GPG signature)
+
+### 4. Automate Exports
+
+Schedule periodic exports for continuous compliance:
+
+```bash
+# crontab entry: export weekly
+0 0 * * 0 faramesh audit export /var/lib/faramesh/dpr.db --since $(date -d '7 days ago' +\%Y-\%m-\%d) --format jsonl > /backups/dpr-$(date +\%Y-\%U).jsonl
+```
+
+## Compliance-Specific Fields
+
+### SOC 2: Change Management Evidence
+
+```json
+{
+  "policy_version": "e5f6a7b8...",  // SHA256 of policy file
+  "policy_source_type": "file",     // "file" | "url" | "database" | "push"
+  "policy_source_id": "/etc/faramesh/policy.yaml"
+}
+```
+
+Correlate `policy_version` with git commits to prove all decisions were made under approved policies.
+
+### HIPAA: Access Control Evidence
+
+```json
+{
+  "principal_id_hash": "a1b2c3d4...",  // HMAC pseudonymized
+  "tool_id": "read_patient_record",
+  "effect": "PERMIT",
+  "matched_rule_id": "allow-physician-read"
+}
+```
+
+Prove that only authorized roles (e.g., physicians) accessed PHI.
+
+### PCI-DSS: Privileged Access Monitoring
+
+```json
+{
+  "principal": {
+    "role": "admin",
+    "verified": true  // Cryptographic identity proof
+  },
+  "tool_id": "stripe/update_customer",
+  "effect": "DEFER",  // Admin actions require approval
+  "defer_token": "abc12345"
+}
+```
+
+Prove that privileged actions (admin, root) are logged and reviewed.
+
+### EU AI Act: Human Oversight Evidence
+
+```json
+{
+  "effect": "DEFER",
+  "reason": "high-value refund requires finance approval",
+  "defer_token": "abc12345",
+  "batch_approval": false,  // Individual review, not batch
+  "resolved_by_batch": false
+}
+```
+
+Prove that high-risk AI decisions were reviewed by humans, not auto-approved.
+
+## PostgreSQL Backend (Enterprise)
+
+For multi-node deployments, use PostgreSQL instead of SQLite:
+
+```bash
+faramesh serve --policy policy.yaml --dpr-store postgres://user:pass@host/db
+```
+
+Benefits:
+- **Centralized audit trail**: All nodes write to the same database
+- **Advanced queries**: PostgreSQL full-text search, JSON operators
+- **Compliance integrations**: Direct SQL access for BI tools (Tableau, Looker)
+
+Export from PostgreSQL:
+```bash
+psql -h host -U user -d db -c "COPY (SELECT * FROM dpr_records WHERE created_at > '2024-01-01') TO STDOUT WITH CSV HEADER" > audit.csv
+```
+
+## Summary
+
+Faramesh provides **compliance-ready governance** out of the box:
+
+✅ **SOC 2**: Logical access controls, system monitoring, incident classification  
+✅ **HIPAA**: 6-year retention, pseudonymized audit logs, no PHI in records  
+✅ **PCI-DSS**: Comprehensive audit trail entries, failed access logging  
+✅ **EU AI Act**: Lifetime event logs, human oversight evidence, tamper-evident integrity  
+
+**OSS Core** (free): All export functionality, local retention, chain verification  
+**Cloud Platform** (Enterprise): Automated reports, 7-year retention, multi-tenant isolation  
+
+For implementation details, see:
+- [Audit Trail](/security/audit-trail) — DPR chain structure and verification
+- [WAL Ordering Invariant](/security/wal-invariant) — Audit completeness guarantees
+- [Threat Model](/security/threat-model) — Security assumptions and limitations

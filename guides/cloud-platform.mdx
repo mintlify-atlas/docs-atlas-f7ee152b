@@ -1,0 +1,464 @@
+---
+title: Faramesh Cloud Platform
+description: Sync policies, audit trails, and advanced features with Faramesh Cloud
+---
+
+The **Faramesh Cloud Platform** extends the open-source core with cloud-managed features: policy sync, compliance exports, cost anomaly detection, cross-agent swarm governance, and fleet management. All open-source features remain fully functional without cloud authentication.
+
+## Open Source + Cloud Model
+
+Faramesh follows a transparent tier model:
+
+| Tier | What You Get | Auth Required? |
+|------|-------------|----------------|
+| **Community** | Full core functionality — policies, budgets, observation, signing, SBOM, delegation | No |
+| **Pro** | Cloud sync, rolling window budgets, cloud registry, cloud attestation | Yes (free account) |
+| **Team** | Anomaly detection, cost forecasting, private packs, cross-org swarm | Yes (Team plan) |
+| **Enterprise** | Fleet management, compliance exports, org-wide policies, fleet budgets | Yes (Enterprise plan) |
+
+<Note>
+  Every feature ships in the open-source binary. Cloud authentication unlocks advanced capabilities, but the core governance engine is **always local-first and works offline**.
+</Note>
+
+## Quick Start
+
+<Steps>
+  <Step title="Sign up for Faramesh Cloud">
+    Create a free account at [faramesh.dev/signup](https://faramesh.dev/signup).
+  </Step>
+
+  <Step title="Log in from the CLI">
+    ```bash
+    faramesh auth login
+    ```
+
+    This opens your browser to authenticate. Your auth token is stored at `~/.faramesh/auth.json`.
+  </Step>
+
+  <Step title="Verify authentication">
+    ```bash
+    faramesh auth status
+    # ✓ Logged in as user@example.com (Pro plan)
+    # Organization: Acme Inc
+    # Plan: Pro
+    ```
+  </Step>
+
+  <Step title="Enable cloud sync">
+    ```bash
+    faramesh serve --policy policy.yaml --cloud-sync
+    ```
+
+    Or set the environment variable:
+    ```bash
+    export FARAMESH_CLOUD_SYNC=true
+    faramesh serve --policy policy.yaml
+    ```
+  </Step>
+</Steps>
+
+## Policy Sync
+
+Cloud sync automatically uploads policies and DPR records to Faramesh Cloud for backup and collaboration.
+
+### Enable Sync
+
+```bash
+faramesh serve --policy policy.yaml --cloud-sync
+```
+
+Or in your Python agent:
+
+```python
+from faramesh import govern
+import os
+
+# Enable cloud sync via environment variable
+os.environ['FARAMESH_CLOUD_SYNC'] = 'true'
+
+governed_tool = govern(
+    my_tool,
+    policy='policy.yaml',
+    agent_id='payment-agent'
+)
+```
+
+### What Gets Synced
+
+- **Policies**: Policy YAML files and compiled versions
+- **DPR records**: Tamper-evident audit trail (decision hashes only, never raw arguments)
+- **Agent metadata**: Agent IDs, session IDs, tool schemas
+- **Metrics**: Decision latency, rule match counts, DENY/DEFER rates
+
+<Warning>
+  **Privacy**: Argument values are never synced. Only structural signatures (shape hashes) are uploaded. See [Privacy](#privacy) for details.
+</Warning>
+
+### Pull Policies from Cloud
+
+```bash
+# List policies in your organization
+faramesh policy list --cloud
+
+# Download a policy from the cloud
+faramesh policy pull payment-agent-v2 > policy.yaml
+
+# Use a cloud policy directly
+faramesh serve --policy cloud://payment-agent-v2
+```
+
+## Compliance Exports
+
+**Team and Enterprise plans** include compliance exports for SOC 2, HIPAA, EU AI Act, and custom formats.
+
+### Export Audit Trail
+
+```bash
+# Export DPR records as JSON
+faramesh audit export --format json --start 2024-01-01 --end 2024-12-31 > audit-2024.json
+
+# Export for SOC 2 compliance
+faramesh audit export --format soc2 --start 2024-01-01 --end 2024-12-31 > soc2-report.pdf
+
+# Export for EU AI Act
+faramesh audit export --format eu-ai-act --agent-id payment-agent > ai-act-compliance.json
+```
+
+### Compliance Formats
+
+- **JSON**: Raw DPR records with full decision metadata
+- **CSV**: Tabular format for Excel/Sheets analysis
+- **SOC 2**: Formatted report with control attestations
+- **HIPAA**: Audit log with PHI access tracking
+- **EU AI Act**: High-risk AI system documentation
+
+<Tip>
+  Schedule automated compliance exports with Cloud Platform integrations (Slack, S3, GCS).
+</Tip>
+
+## Fleet Management
+
+**Enterprise plans** include fleet-wide policy management and observability.
+
+### Register Agents
+
+```bash
+# Register an agent with the fleet
+faramesh fleet register \
+  --agent-id payment-agent \
+  --environment production \
+  --region us-east-1
+```
+
+### Deploy Fleet-Wide Policies
+
+```bash
+# Push a policy to all production agents
+faramesh policy deploy \
+  --policy policy.yaml \
+  --environment production \
+  --rollout gradual  # or: immediate, canary
+```
+
+### Fleet Observability
+
+```bash
+# View all active agents
+faramesh fleet list
+
+# Stream decisions from all agents
+faramesh fleet audit tail --environment production
+
+# Kill switch for all agents in a region
+faramesh fleet kill --region us-west-2 --reason "security incident"
+```
+
+## Cost Analytics
+
+**Pro and Team plans** include cost tracking and anomaly detection for LLM and API spend.
+
+### Enable Cost Tracking
+
+Annotate tool calls with cost metadata in your policy:
+
+```yaml policy.yaml
+faramesh-version: '1.0'
+agent-id: chatbot
+default_effect: permit
+
+rules:
+  - id: track-openai-cost
+    match:
+      tool: openai_chat
+    effect: permit
+    cost:
+      provider: openai
+      model: gpt-4
+      input_tokens: 'args["messages"] | length * 100'  # Estimate
+      output_tokens: 'response["usage"]["completion_tokens"]'
+```
+
+### View Cost Dashboard
+
+```bash
+# View cost summary
+faramesh cost summary --start 2024-01-01 --end 2024-12-31
+
+# Output:
+# Agent: chatbot
+# Total Cost: $1,247.32
+# Top Tools:
+#   - openai_chat: $987.12 (79%)
+#   - anthropic_chat: $210.20 (17%)
+#   - cohere_embed: $50.00 (4%)
+```
+
+### Cost Alerts
+
+```bash
+# Set a cost alert
+faramesh cost alert \
+  --agent-id chatbot \
+  --threshold 1000 \
+  --period daily \
+  --notify slack://alerts-channel
+```
+
+## Anomaly Detection
+
+**Team plans** include behavioral anomaly detection for unusual agent activity.
+
+### Enable Anomaly Detection
+
+```bash
+faramesh serve --policy policy.yaml --cloud-sync --anomaly-detection
+```
+
+### View Anomalies
+
+```bash
+faramesh anomaly list --agent-id payment-agent
+
+# Output:
+# [2024-12-15 10:23:45] HIGH   Unusual tool call frequency (10x baseline)
+# [2024-12-15 14:12:30] MEDIUM New tool never seen before: send_wire_transfer
+# [2024-12-14 22:05:10] LOW    Off-hours activity (outside 9am-5pm)
+```
+
+### Configure Detection Rules
+
+```yaml anomaly-config.yaml
+anomalies:
+  - type: frequency
+    tool: stripe_refund
+    threshold: 10  # Alert if >10x baseline
+    window: 1h
+
+  - type: new_tool
+    severity: high
+    notify: slack://security-alerts
+
+  - type: off_hours
+    allowed_hours: "09:00-17:00"
+    timezone: America/New_York
+```
+
+## Cross-Agent Swarm Governance
+
+**Team plans** include swarm-level policies that govern interactions between multiple agents.
+
+### Define Swarm Policy
+
+```yaml swarm-policy.yaml
+faramesh-version: '1.0'
+swarm-id: customer-support-swarm
+default_effect: permit
+
+rules:
+  # Prevent circular delegation
+  - id: deny-circular-delegation
+    match:
+      event: agent.delegate
+      when: 'delegation_chain contains current_agent_id'
+    effect: deny
+    reason: circular delegation detected
+
+  # Require approval for cross-agent data access
+  - id: defer-cross-agent-data
+    match:
+      event: agent.read_data
+      when: 'data_owner_agent_id != current_agent_id'
+    effect: defer
+    reason: cross-agent data access requires approval
+
+  # Track swarm budget
+  - id: deny-swarm-budget-exceeded
+    match:
+      tool: "*"
+      when: 'swarm.total_cost > 10000'
+    effect: deny
+    reason: swarm budget exceeded ($10k daily limit)
+```
+
+### Deploy Swarm Policy
+
+```bash
+faramesh swarm deploy \
+  --policy swarm-policy.yaml \
+  --agents payment-agent,fraud-agent,support-agent
+```
+
+## Privacy
+
+Faramesh Cloud never sees raw tool arguments. Only structural signatures are synced:
+
+<CodeGroup>
+```json Local Decision Record
+{
+  "call_id": "abc123",
+  "tool_id": "stripe_refund",
+  "args": {
+    "amount": 1000,
+    "currency": "usd",
+    "customer_id": "cust_abc123"
+  },
+  "effect": "PERMIT"
+}
+```
+
+```json Cloud-Synced Record
+{
+  "call_id": "abc123",
+  "tool_id": "stripe_refund",
+  "args_signature": "sha256:a1b2c3...",  # Hash of argument structure
+  "args_schema": {
+    "amount": "float",
+    "currency": "string",
+    "customer_id": "string"
+  },
+  "effect": "PERMIT",
+  "policy_version": "sha256:d4e5f6..."
+}
+```
+</CodeGroup>
+
+<Note>
+  **Argument values are never uploaded**. Only shapes (types and keys) are synced for behavioral analysis.
+</Note>
+
+## SSO and SCIM
+
+**Enterprise plans** include SSO (SAML, OIDC) and SCIM provisioning.
+
+### Configure SSO
+
+```bash
+faramesh auth sso configure \
+  --provider okta \
+  --sso-url https://company.okta.com/app/faramesh/sso/saml \
+  --issuer https://company.okta.com
+```
+
+### SCIM Provisioning
+
+```bash
+faramesh auth scim enable \
+  --token <scim-token> \
+  --endpoint https://api.faramesh.dev/scim/v2
+```
+
+## API Keys
+
+Generate API keys for programmatic access:
+
+```bash
+# Create an API key
+faramesh auth api-key create --name ci-pipeline
+
+# Output:
+# API Key: fm_sk_1234567890abcdef
+# Store this key securely. It will not be shown again.
+
+# Use the API key
+export FARAMESH_API_KEY=fm_sk_1234567890abcdef
+faramesh policy deploy --policy policy.yaml
+```
+
+## Offline Mode
+
+Faramesh works fully offline. Cloud sync is opportunistic:
+
+```bash
+# Daemon continues to work without cloud connectivity
+faramesh serve --policy policy.yaml --cloud-sync
+
+# If cloud is unreachable, decisions are still evaluated locally
+# DPR records are queued and synced when connectivity is restored
+```
+
+<Tip>
+  Use `--cloud-sync-interval` to control sync frequency:
+  ```bash
+  faramesh serve --policy policy.yaml --cloud-sync --cloud-sync-interval 300s
+  # Sync every 5 minutes instead of real-time
+  ```
+</Tip>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Authentication failed">
+    Re-authenticate:
+    ```bash
+    faramesh auth logout
+    faramesh auth login
+    ```
+
+    Check your auth status:
+    ```bash
+    faramesh auth status
+    ```
+  </Accordion>
+
+  <Accordion title="Cloud sync not working">
+    Check connectivity:
+    ```bash
+    curl https://api.faramesh.dev/health
+    ```
+
+    Enable verbose logging:
+    ```bash
+    faramesh serve --policy policy.yaml --cloud-sync --log-level debug
+    ```
+  </Accordion>
+
+  <Accordion title="DPR records not syncing">
+    Check sync queue:
+    ```bash
+    faramesh cloud sync status
+    # Output: 42 records pending upload
+    ```
+
+    Force sync:
+    ```bash
+    faramesh cloud sync now
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Policy Language" icon="file-lines" href="/concepts/policy-engine">
+    Write advanced cloud-integrated policies
+  </Card>
+  <Card title="DPR Chain" icon="link" href="/concepts/dpr-chain">
+    Understand the audit trail structure
+  </Card>
+  <Card title="Python SDK" icon="python" href="/guides/python-sdk">
+    Use cloud sync with the Python SDK
+  </Card>
+  <Card title="Kubernetes" icon="dharmachakra" href="/guides/kubernetes">
+    Deploy cloud-connected agents on Kubernetes
+  </Card>
+</CardGroup>

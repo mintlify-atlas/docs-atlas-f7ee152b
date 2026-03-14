@@ -1,0 +1,398 @@
+---
+title: 'Audit Trail'
+description: 'DPR chain verification, live streaming, and forensic analysis'
+---
+
+## Overview
+
+Every governance decision in Faramesh is recorded in the **Decision Provenance Record (DPR)** chain — a tamper-evident, cryptographically linked audit trail. Each record is SHA256-hashed and linked to the previous record, forming a blockchain-style integrity guarantee.
+
+## DPR Record Structure
+
+From `/home/daytona/workspace/source/internal/core/dpr/record.go:17-95`:
+
+```go
+type Record struct {
+    // ── Schema & Chain Integrity ──
+    SchemaVersion  string // "dpr/1.0"
+    RecordID       string // UUID
+    PrevRecordHash string // SHA256 of previous record (linked list)
+    RecordHash     string // SHA256 of this record's canonical bytes
+    HMACSig        string // Optional HMAC-SHA256 for non-repudiation
+
+    // ── Identity & Request ──
+    AgentID          string
+    SessionID        string
+    ToolID           string
+    InterceptAdapter string
+    PrincipalIDHash  string // HMAC pseudonymized (GDPR-compliant)
+
+    // ── Decision ──
+    Effect        string // PERMIT | DENY | DEFER | SHADOW
+    MatchedRuleID string // Policy rule that triggered
+    ReasonCode    string // Machine-readable code (e.g., "SHELL_CLASSIFIER_RM_RF")
+    Reason        string // Human-readable explanation
+    DenialToken   string // Opaque token for operator lookup
+
+    // ── Policy Context ──
+    PolicyVersion     string // SHA256 of policy file
+    ArgsStructuralSig string // Hash of argument shape (not values)
+
+    // ... 30+ additional fields for multi-agent, callbacks, degraded mode ...
+
+    CreatedAt time.Time
+}
+```
+
+### Chain Integrity Fields
+
+- **`record_hash`**: SHA256 of this record's canonical bytes (excludes `record_hash` and `hmac_signature` to avoid circular dependency)
+- **`prev_record_hash`**: Links to the previous record in the chain
+- **Genesis record**: The first record for an agent uses a deterministic genesis hash: `SHA256(agent_id + session_id + "genesis")`
+
+### Privacy-Preserving Design
+
+<Warning>
+**GDPR Compliance**: DPR records **never** store raw argument values or personally identifiable information. Only structural signatures and pseudonymized hashes are stored.
+</Warning>
+
+- **`args_structural_sig`**: Hash of argument shape (key names + value types), never values  
+  Example: `{amount: number, currency: string}` → `SHA256("{amount:number,currency:string}")[:16]`
+
+- **`principal_id_hash`**: HMAC pseudonymized user ID (cannot be reversed without the HMAC key)
+
+Raw values are **only** stored in the local WAL (append-only, access-controlled) and are not replicated to cloud systems.
+
+## Chain Verification
+
+### Verify Command
+
+Verify the SHA256 integrity of a DPR database:
+
+```bash
+faramesh audit verify ~/.faramesh/faramesh.db
+```
+
+Output:
+```
+✓ Chain integrity verified. 1,247 records, 0 violations.
+```
+
+If tampering is detected:
+```
+✗ CHAIN VIOLATION record 42: expected hash a1b2c3... but found d4e5f6...
+✗ 1 chain integrity violation(s) detected.
+```
+
+### Verification Algorithm
+
+From `/home/daytona/workspace/source/internal/core/dpr/sqlite.go:182-220`:
+
+```go
+func (s *Store) VerifyChain(agentID string) (*ChainBreak, error) {
+    // Read records in chronological order (oldest first)
+    records := s.query("ORDER BY created_at ASC")
+
+    for i, rec := range records {
+        // 1. Recompute hash from canonical bytes
+        saved := rec.RecordHash
+        rec.ComputeHash()
+        if rec.RecordHash != saved {
+            return &ChainBreak{RecordID: rec.RecordID, ExpectedHash: rec.RecordHash, ActualHash: saved}
+        }
+
+        // 2. Verify chain link (skip genesis)
+        if i > 0 && rec.PrevRecordHash != records[i-1].RecordHash {
+            return &ChainBreak{RecordID: rec.RecordID, PrevRecordHash: rec.PrevRecordHash}
+        }
+    }
+    return nil, nil // No breaks found
+}
+```
+
+**Properties verified**:
+1. **Hash integrity**: Each record's `record_hash` matches the SHA256 of its canonical bytes
+2. **Chain continuity**: Each `prev_record_hash` points to the actual hash of the previous record
+3. **No forks**: A single linear chain per agent (no branching)
+
+### What Chain Verification Detects
+
+✅ **Record modification**: Changing any field (effect, tool_id, timestamp) invalidates the hash  
+✅ **Record deletion**: Breaks the chain link  
+✅ **Record insertion**: Creates a hash mismatch with the next record  
+✅ **Reordering**: Breaks the `prev_record_hash` link  
+
+❌ **Does not detect**: Deletion of the entire database (use off-system replication)
+
+## Live Audit Stream
+
+### Tail Command
+
+Stream live governance decisions from a running daemon:
+
+```bash
+faramesh audit tail
+```
+
+Output:
+```
+Faramesh Audit Tail — streaming decisions (Ctrl+C to stop)
+
+[10:00:15] PERMIT  get_exchange_rate      payment-bot      rule=allow-read-only  11ms
+[10:00:17] DENY    shell/run              payment-bot      rule=deny-shell       0ms
+[10:00:18] PERMIT  read_customer          payment-bot      9ms
+[10:00:20] DEFER   stripe/refund          payment-bot      rule=defer-high-value 5ms
+```
+
+Color-coded effects:
+- 🟢 **PERMIT** (green)
+- 🔴 **DENY** (red)
+- 🟡 **DEFER** (yellow)
+
+### Filter by Agent
+
+```bash
+faramesh audit tail --agent payment-bot
+```
+
+### Implementation
+
+From `/home/daytona/workspace/source/cmd/faramesh/audit.go:52-117`:
+
+1. Client sends `{"type": "audit_subscribe", "agent_id": "..."}` to the daemon's Unix socket
+2. Daemon pushes one JSON line per decision to the client
+3. Client decodes and prints with color formatting
+
+This is a **real-time stream** — no polling, no database queries. The daemon's `SetHorizonSyncer()` hook forwards decisions to the audit subscriber.
+
+## Audit Statistics
+
+### Stats Command
+
+Generate aggregate statistics from the DPR database:
+
+```bash
+faramesh audit stats ~/.faramesh/faramesh.db
+```
+
+Output:
+```
+DPR Audit Statistics — ~/.faramesh/faramesh.db
+  Total records : 1,247
+  Unique agents : 3
+  Unique tools  : 42
+
+  Decisions by effect:
+    PERMIT   892
+    DENY     312
+    DEFER    43
+
+  Top deny reason codes:
+    SHELL_CLASSIFIER_RM_RF              87
+    HIGH_ENTROPY_SECRET                 54
+    BUDGET_SESSION_EXCEEDED             42
+    PATH_TRAVERSAL                      31
+    DENY_MASS_EMAIL                     28
+```
+
+Use for:
+- **Security monitoring**: Track DENY spikes (potential attacks)
+- **Policy tuning**: Identify over-restrictive rules (high DEFER rate)
+- **Compliance reporting**: Evidence of active governance
+
+## Compliance Exports
+
+### Export Command
+
+Export DPR records for external compliance tools (SOC 2, HIPAA, PCI-DSS auditors):
+
+```bash
+# JSON (human-readable)
+faramesh audit export data/dpr.db --format json > audit.json
+
+# CSV (Excel-compatible)
+faramesh audit export data/dpr.db --format csv > audit.csv
+
+# JSONL (streaming / jq-friendly)
+faramesh audit export data/dpr.db --format jsonl | jq '.effect'
+```
+
+### Filtering
+
+```bash
+# DENY decisions only
+faramesh audit export data/dpr.db --effect DENY --format csv
+
+# Specific agent
+faramesh audit export data/dpr.db --agent payment-bot --since 2024-01-01
+
+# Last 100 records
+faramesh audit export data/dpr.db --limit 100
+```
+
+### Verification on Export
+
+Verify chain integrity during export:
+
+```bash
+faramesh audit export data/dpr.db --verify --format json
+```
+
+If violations are detected, a warning is printed to stderr:
+```
+WARNING: 2 chain integrity violations detected
+```
+
+The export completes (for forensic analysis), but the warning flags the audit trail as compromised.
+
+### Export Formats
+
+From `/home/daytona/workspace/source/cmd/faramesh/audit_extended.go:111-176`:
+
+**JSON** (`--format json`):
+```json
+[
+  {
+    "record_id": "a1b2c3d4-...",
+    "agent_id": "payment-bot",
+    "tool_id": "stripe/refund",
+    "effect": "PERMIT",
+    "matched_rule_id": "allow-refund",
+    "policy_version": "e5f6a7b8...",
+    "created_at": "2024-01-15T10:30:45.123Z"
+  }
+]
+```
+
+**CSV** (`--format csv`):
+```csv
+record_id,created_at,agent_id,tool_id,effect,matched_rule_id,policy_version
+a1b2c3...,2024-01-15T10:30:45Z,payment-bot,stripe/refund,PERMIT,allow-refund,e5f6a7b8...
+```
+
+**JSONL** (`--format jsonl`):
+```jsonl
+{"record_id":"a1b2c3...","agent_id":"payment-bot",...}
+{"record_id":"d4e5f6...","agent_id":"support-bot",...}
+```
+
+JSONL is ideal for streaming to log aggregation systems (Splunk, Elasticsearch, S3 → Athena).
+
+## Forensic Analysis
+
+### Incident Timeline Reconstruction
+
+1. **Identify the incident window**:
+   ```bash
+   faramesh audit export data/dpr.db --since 2024-01-15T10:00:00Z --limit 1000 --format jsonl > incident.jsonl
+   ```
+
+2. **Filter suspicious activity**:
+   ```bash
+   cat incident.jsonl | jq 'select(.effect == "DENY" and .reason_code == "SHELL_CLASSIFIER_RM_RF")'
+   ```
+
+3. **Trace agent behavior**:
+   ```bash
+   cat incident.jsonl | jq 'select(.agent_id == "payment-bot") | {tool_id, effect, created_at}'
+   ```
+
+4. **Correlate with policy changes**:
+   ```bash
+   cat incident.jsonl | jq 'select(.policy_version != "e5f6a7b8...") | .policy_version' | sort | uniq
+   ```
+
+### Multi-Agent Linkage
+
+DPR records include multi-agent linkage fields:
+- `invoked_by_agent_id`: Parent agent that triggered this call
+- `invoked_by_dpr_record_id`: DPR record of the parent decision
+- `inner_governance_dpr_id`: Sub-agent governance record
+
+Use these to trace **delegation chains** and **agent-to-agent calls**.
+
+## Retention & Archival
+
+### Local Retention
+
+SQLite databases can grow large (1 GB = ~5 million records). Rotate old records:
+
+```bash
+# Archive records older than 90 days
+faramesh audit export data/dpr.db --since $(date -d '90 days ago' +%Y-%m-%d) --format jsonl > archive-2024-Q1.jsonl
+
+# (Future) Prune old records
+faramesh audit prune data/dpr.db --older-than 90d
+```
+
+<Warning>
+**Before pruning**: Export and verify the archive. Chain verification only works on contiguous records — pruning creates gaps.
+</Warning>
+
+### Cloud Replication
+
+Faramesh Cloud Platform provides:
+- **Immutable audit storage**: Records are replicated to S3 / GCS with versioning
+- **Compliance exports**: Pre-built SOC 2, HIPAA, EU AI Act reports
+- **Long-term retention**: 7-year retention for regulated industries
+
+See [Compliance Exports](/security/compliance-exports) for cloud features.
+
+## Performance Considerations
+
+### SQLite Query Performance
+
+DPR tables are indexed on:
+- `(agent_id, created_at)` — fast agent-specific queries
+- `(effect, created_at)` — fast filtering by PERMIT/DENY/DEFER
+- `(session_id, created_at)` — fast session reconstruction
+- `(incident_category, incident_severity)` — fast security event queries
+
+Queries on 1M records: **< 100 ms** on modern SSDs.
+
+### WAL vs SQLite
+
+Recall the [WAL Ordering Invariant](/security/wal-invariant):
+- **WAL**: Durability (fsync on every write)
+- **SQLite**: Queries (async replication)
+
+If SQLite is slow, it **does not affect** governance latency. Decisions are based on WAL writes, not SQLite.
+
+## Security Properties
+
+### Tamper Resistance
+
+| Attack | Detection |
+|--------|----------|
+| Modify a record's `effect` field | ✅ Hash mismatch on `faramesh audit verify` |
+| Delete a record | ✅ Chain break detected (missing `prev_record_hash` link) |
+| Insert a forged record | ✅ Hash mismatch with next record |
+| Reorder records | ✅ Chain links are chronological, not reorderable |
+| Replace entire database | ❌ **Requires off-system replication** (Horizon Cloud) |
+
+### Non-Repudiation (Optional)
+
+Enable HMAC signatures for non-repudiation:
+
+```yaml
+# policy.yaml
+faramesh-version: '1.0'
+audit:
+  hmac_key_env: FARAMESH_HMAC_KEY  # Load from environment variable
+```
+
+Each DPR record will include:
+```json
+{
+  "record_hash": "a1b2c3...",
+  "hmac_signature": "HMAC-SHA256(record_hash, secret_key)"
+}
+```
+
+This proves the record was created by a Faramesh instance with access to the secret key (useful for multi-tenant deployments).
+
+## Related Documentation
+
+- [WAL Ordering Invariant](/security/wal-invariant) — Audit-first execution guarantee
+- [Compliance Exports](/security/compliance-exports) — SOC 2, HIPAA, EU AI Act reporting
+- [Threat Model](/security/threat-model) — Audit tampering attack scenarios

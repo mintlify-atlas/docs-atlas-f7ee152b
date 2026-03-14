@@ -1,0 +1,227 @@
+---
+title: Architecture
+description: Unified core + thin adapters — the invariant principle that makes Faramesh work everywhere
+---
+
+## The Invariant Core Principle
+
+Faramesh is built on the same architecture principle that made Terraform, Vault, and Datadog successful: **unified core + thin adapters**. One policy language, one evaluation engine, one audit format — regardless of where your agent runs.
+
+```
+┌──────────────────────── FARAMESH INVARIANT CORE ────────────────────────┐
+│  Policy Engine │ DPR Chain │ Session State │ DEFER Workflow │ Cloud     │
+│  (YAML+expr)   │ (WAL-first│               │ (channel park) │ Platform  │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │ CanonicalActionRequest + DPR write
+                                 │ (same format regardless of adapter)
+┌────────────────────────────────▼────────────────────────────────────────┐
+│                  ADAPTER STACK (auto-selected per environment)           │
+│                                                                          │
+│  A1: SDK Shim          A2: Local Daemon       A3: Sidecar + Proxy       │
+│  Python/JS/Go/TS       Unix socket + broker   Transparent HTTP/gRPC     │
+│  <60 sec on-ramp       Works everywhere       Network isolation         │
+│                                                                          │
+│  A4: Serverless        A5: MCP Gateway        A6: eBPF (optional)      │
+│  Lambda/Cloud Run      Faramesh IS the MCP    Kernel-level on Linux     │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+## Canonical Action Request (CAR)
+
+Every tool call — regardless of adapter — is normalized into a `CanonicalActionRequest` before governance:
+
+```go internal/core/types.go
+type CanonicalActionRequest struct {
+    // CallID is a UUID v4 assigned by the adapter for idempotency.
+    CallID string `json:"call_id"`
+
+    // AgentID is the identity of the agent making the call.
+    AgentID string `json:"agent_id"`
+
+    // SessionID groups calls within a single agent session.
+    SessionID string `json:"session_id"`
+
+    // ToolID identifies the tool being called, e.g. "stripe/refund".
+    ToolID string `json:"tool_id"`
+
+    // Args are the raw arguments to the tool call.
+    Args map[string]any `json:"args"`
+
+    // Timestamp is when the adapter received the call.
+    Timestamp time.Time `json:"timestamp"`
+
+    // InterceptAdapter identifies which adapter delivered this request.
+    // "sdk" for A1, "proxy" for A3, "mcp" for A5, "ebpf" for A6.
+    InterceptAdapter string `json:"intercept_adapter"`
+
+    // Principal is the invoking human/system identity (optional).
+    Principal *principal.Identity `json:"principal,omitempty"`
+
+    // Delegation is the delegation chain if this is a delegated call.
+    Delegation *principal.DelegationChain `json:"delegation,omitempty"`
+}
+```
+
+**CAR version: `car/1.0`** — The specification is versioned. Breaking changes increment the version.
+
+## The 11-Step Evaluation Pipeline
+
+Every CAR flows through an identical evaluation pipeline in `internal/core/pipeline.go`:
+
+```
+CanonicalActionRequest
+ │
+ ├─[0]  Canonicalization       NFKC normalization, confusable mapping
+ ├─[1]  Kill switch check       atomic.Bool per agent_id — nanoseconds
+ ├─[2]  Phase check             tool visible in current workflow phase?
+ ├─[3]  Pre-execution scanners  shell, secret, PII — parallel goroutines
+ ├─[4]  Session state read      sync.Map counters + ring buffer
+ ├─[5]  History ring read       last N calls within T seconds
+ ├─[6]  External selector fetch lazy, parallel, cached, timeout-bounded
+ ├─[7]  Policy evaluation       expr-lang bytecode, first-match-wins, ~1μs/rule
+ ├─[8]  Decision                PERMIT | DENY | DEFER | SHADOW
+ ├─[9]  WAL write ──────────── fsync to local disk BEFORE returning decision
+ ├─[10] Async                   replicate to SQLite DPR, update session + history
+ └─[11] Return Decision         to adapter
+```
+
+<Info>
+**WAL Ordering Invariant**: Step 9 (WAL write) happens inside `Evaluate()` before the Decision is returned. If the WAL write fails → DENY. Execution must never precede the audit record.
+</Info>
+
+## Decision Type
+
+The pipeline returns a `Decision`:
+
+```go internal/core/types.go
+type Effect string
+
+const (
+    EffectPermit       Effect = "PERMIT"
+    EffectDeny         Effect = "DENY"
+    EffectDefer        Effect = "DEFER"
+    EffectShadow       Effect = "SHADOW"
+    EffectShadowPermit Effect = "SHADOW_PERMIT"
+)
+
+type Decision struct {
+    Effect         Effect        `json:"effect"`
+    RuleID         string        `json:"rule_id"`
+    ReasonCode     string        `json:"reason_code"`
+    Reason         string        `json:"reason"`
+    DenialToken    string        `json:"denial_token,omitempty"`
+    DeferToken     string        `json:"defer_token,omitempty"`
+    PolicyVersion  string        `json:"policy_version"`
+    DPRRecordID    string        `json:"dpr_record_id,omitempty"`
+    Latency        time.Duration `json:"-"`
+}
+```
+
+## Adapter Responsibility
+
+Adapters have **one job**: translate their environment into a CAR and act on the Decision. They do NOT:
+
+- Evaluate policy (core does this)
+- Manage session state (core does this)
+- Write audit records (core does this)
+- Handle DEFER workflow (core does this)
+
+Adapters DO:
+
+- Normalize tool calls into `CanonicalActionRequest`
+- Send the CAR to the core pipeline
+- Block on `DEFER` (SDK) or return 202 Accepted (HTTP)
+- Enforce `DENY` by raising an exception or returning 403
+- Allow `PERMIT` to proceed
+
+<CodeGroup>
+```python SDK Adapter (A1)
+from faramesh import govern
+
+# The SDK adapter auto-starts the daemon and sends CARs over Unix socket.
+governed_refund = govern(stripe_refund, policy='payment.yaml', agent_id='bot')
+
+try:
+    result = governed_refund(amount=100, currency='usd')
+except DenyError as e:
+    print(f"DENY: {e.reason}")  # Decision.Reason
+except DeferredError as e:
+    print(f"DEFER: approve with: faramesh agent approve {e.defer_token}")
+```
+
+```bash Daemon Adapter (A2)
+# The daemon loads policy, opens WAL, listens on /tmp/faramesh.sock
+faramesh serve --policy payment.yaml
+```
+
+```yaml Sidecar Adapter (A3)
+# Kubernetes sidecar + NetworkPolicy intercepts HTTP/gRPC
+apiVersion: v1
+kind: Pod
+metadata:
+  name: agent-pod
+spec:
+  containers:
+  - name: agent
+    image: my-agent:latest
+  - name: faramesh-sidecar
+    image: ghcr.io/faramesh/faramesh:latest
+    args: ["serve", "--policy", "/config/policy.yaml"]
+```
+</CodeGroup>
+
+## Internal Package Structure
+
+The core is decomposed into focused packages:
+
+```
+internal/core/
+├── pipeline.go          — Main evaluation pipeline (WAL-first, atomic)
+├── types.go             — CanonicalActionRequest, Decision, Effect
+├── policy/
+│   ├── engine.go        — Rule evaluation engine (~1μs per rule)
+│   ├── schema.go        — Policy YAML schema (FPL v1.0)
+│   └── selectors.go     — External data selectors
+├── dpr/
+│   ├── record.go        — DPR record types
+│   ├── wal.go           — Write-ahead log (fsync before return)
+│   ├── sqlite.go        — SQLite backend (async replication)
+│   └── postgres.go      — PostgreSQL backend
+├── defer/
+│   ├── workflow.go      — DEFER workflow (park, poll, approve/deny)
+│   ├── channels/        — Channel-based signaling
+│   └── backends/        — Pluggable DEFER backends (Slack, PagerDuty)
+├── session/
+│   ├── state.go         — Session state management
+│   ├── memory_backend.go— In-memory backend (default)
+│   └── redis_backend.go — Redis backend (multi-instance)
+└── multiagent/
+    ├── budget.go        — Shared budget management
+    ├── sessiongov.go    — Session governance
+    └── linkage.go       — Agent linkage tracking
+```
+
+## Why This Matters
+
+A developer who writes a Faramesh policy for their Jupyter notebook has already learned everything needed to govern their production Kubernetes fleet. **Only the adapter changes** — and `faramesh init --auto-detect` selects it automatically.
+
+<Check>
+**Zero vendor lock-in**: The policy YAML is portable. The DPR chain is SQLite (or Postgres). The core is open source. Move between environments without rewriting governance logic.
+</Check>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Policy Engine" icon="gavel" href="/concepts/policy-engine">
+    Learn how rules are compiled to bytecode and evaluated at ~1μs per rule
+  </Card>
+  <Card title="DPR Chain" icon="link" href="/concepts/dpr-chain">
+    Understand the tamper-evident audit trail
+  </Card>
+  <Card title="Adapters" icon="plug" href="/concepts/adapters">
+    Explore the six deployment adapters
+  </Card>
+  <Card title="Multi-Agent" icon="users" href="/concepts/multi-agent">
+    Govern fleets with shared budgets and session state
+  </Card>
+</CardGroup>

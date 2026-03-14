@@ -1,0 +1,504 @@
+---
+title: 'Core Modules'
+description: 'Reference for internal/core/ modules: defer, dpr, policy, session, and more'
+---
+
+## Module Map
+
+The `internal/core/` directory contains the invariant governance logic. Every module is adapter-agnostic and tested independently.
+
+```
+internal/core/
+├── pipeline.go              Main 11-step evaluation engine
+├── types.go                 CAR, Decision, Effect types
+├── canonicalize/            Unicode normalization, confusable mapping
+├── defer/                   DEFER workflow (park, poll, approve/deny)
+├── dpr/                     Decision Provenance Record chain
+├── policy/                  Policy engine (expr-lang evaluation)
+├── session/                 Session state (call counts, cost, history)
+├── observe/                 Telemetry, metrics, PIE analysis
+├── multiagent/              Multi-agent orchestration, swarm governance
+├── principal/               Identity, SPIFFE, workload attestation
+├── postcondition/           Post-execution output scanning
+├── contextguard/            External context validation
+├── credential/              Credential broker and routing
+├── compensation/            Compensation engine for failed operations
+├── phases/                  Workflow phase management
+├── reasons/                 Structured denial reason codes
+├── sandbox/                 Sandboxed execution environment
+└── webhook/                 Webhook notification sender
+```
+
+---
+
+## defer/ — DEFER Workflow
+
+Implements human-in-the-loop approval for tool calls that require judgment.
+
+### Architecture
+
+```
+Agent calls tool with high-value args
+  → Policy evaluates: effect=DEFER
+  → SDK blocks (polls every 2s)
+  → Slack notification sent with approve/deny commands
+  → Operator runs: faramesh agent approve <token>
+  → SDK unblocks, function executes
+```
+
+### Types
+
+```go title="internal/core/defer/workflow.go"
+type Handle struct {
+    Token     string
+    AgentID   string
+    ToolID    string
+    Reason    string
+    CreatedAt time.Time
+    Deadline  time.Time    // Default: 5 minutes from creation
+    ch        chan Resolution
+}
+
+type Resolution struct {
+    Approved     bool
+    Reason       string
+    Status       DeferStatus  // pending | approved | denied | expired
+    ModifiedArgs map[string]any // conditional approval with modified args
+}
+```
+
+### Workflow Manager
+
+```go
+type Workflow struct {
+    mu       sync.Mutex
+    pending  map[string]*Handle       // token → pending DEFER
+    resolved map[string]*resolvedHandle // token → final resolution
+    slackURL string                    // optional Slack webhook
+}
+```
+
+**Key Operations**:
+
+```go
+// Create a DEFER with deterministic token (idempotent)
+handle, err := workflow.DeferWithToken(token, agentID, toolID, reason)
+
+// Wait for resolution (blocks caller)
+resolution, approved := deferwork.Wait(handle)
+
+// Approve/deny from CLI or webhook
+err := workflow.Resolve(token, approved=true, reason="finance approved")
+
+// Conditional approval with modified args
+err := workflow.ResolveWithModifiedArgs(token, reason, modifiedArgs)
+```
+
+### Timeout Behavior
+
+DEFER handles auto-expire after 5 minutes (configurable). The expiry goroutine:
+
+```go
+go func() {
+    select {
+    case <-time.After(time.Until(h.Deadline)):
+        res := Resolution{Approved: false, Status: StatusExpired}
+        h.ch <- res  // unblock waiter with expired status
+    case <-h.ch:
+        // already resolved
+    }
+}()
+```
+
+Expired DEFERs are treated as DENY by the adapter.
+
+---
+
+## dpr/ — Decision Provenance Record Chain
+
+Every governance decision is cryptographically linked into a tamper-evident audit chain.
+
+### Record Structure
+
+```go title="internal/core/dpr/record.go"
+type Record struct {
+    // Chain Integrity
+    SchemaVersion  string  // "dpr/1.0"
+    RecordID       string  // UUID v4
+    PrevRecordHash string  // SHA256 of previous record
+    RecordHash     string  // SHA256 of this record's canonical bytes
+    HMACSig        string  // Optional HMAC for non-repudiation
+
+    // Identity & Request
+    AgentID          string
+    SessionID        string
+    ToolID           string
+    InterceptAdapter string  // "sdk" | "daemon" | "mcp" | "ebpf"
+    PrincipalIDHash  string  // Pseudonymized (GDPR-safe)
+
+    // Decision
+    Effect        string  // PERMIT | DENY | DEFER | SHADOW
+    MatchedRuleID string
+    ReasonCode    string
+    DenialToken   string
+
+    // Policy Context
+    PolicyVersion     string
+    ArgsStructuralSig string  // Shape hash (no values)
+
+    // Metadata
+    WorkflowPhase         string
+    CredentialBrokered    bool
+    ExecutionEnvironment  string
+    InvokedByAgentID      string  // Multi-agent linkage
+    DegradedMode          string
+
+    CreatedAt time.Time
+}
+```
+
+### Chain Construction
+
+```go
+func (p *Pipeline) buildRecord(req CanonicalActionRequest, d Decision) *dpr.Record {
+    prevHash := p.chainMu[req.AgentID]
+    if prevHash == "" {
+        // Genesis record: deterministic hash from agent ID
+        prevHash = sha256(req.AgentID + req.SessionID + "genesis")
+    }
+
+    rec := &dpr.Record{
+        RecordID:       uuid.New().String(),
+        PrevRecordHash: prevHash,
+        AgentID:        req.AgentID,
+        Effect:         string(d.Effect),
+        PolicyVersion:  d.PolicyVersion,
+        ArgsStructuralSig: dpr.ArgsSignature(req.Args),
+        CreatedAt:      req.Timestamp,
+    }
+
+    rec.ComputeHash()  // SHA256 of canonical bytes
+    p.chainMu[req.AgentID] = rec.RecordHash
+    return rec
+}
+```
+
+### Verification
+
+```bash
+faramesh audit verify ~/.faramesh/faramesh.db
+# ✓ Chain integrity verified. 1,247 records, 0 violations.
+```
+
+```go
+func (s *Store) VerifyChain(agentID string) (*ChainBreak, error) {
+    records := s.loadRecordsChronological(agentID)
+    for i, rec := range records {
+        saved := rec.RecordHash
+        rec.ComputeHash()  // recompute from canonical bytes
+        if rec.RecordHash != saved {
+            return &ChainBreak{Position: i, RecordID: rec.RecordID}
+        }
+        if i > 0 && rec.PrevRecordHash != records[i-1].RecordHash {
+            return &ChainBreak{Position: i}  // chain link broken
+        }
+    }
+    return nil, nil  // chain is intact
+}
+```
+
+### Structural Signature
+
+Arguments are hashed by **shape only** (keys + types), never values:
+
+```go
+func ArgsSignature(args map[string]any) string {
+    sig := structuralSig(args, 0)
+    return sha256(sig)[:16]
+}
+
+func structuralSig(v any, depth int) string {
+    switch val := v.(type) {
+    case map[string]any:
+        parts := []
+        for k, child := range val {
+            parts = append(parts, k+":"+structuralSig(child, depth+1))
+        }
+        return "{" + join(parts) + "}"
+    case string:  return "string"
+    case float64: return "number"
+    case bool:    return "bool"
+    }
+}
+```
+
+Example:
+```json
+{"amount": 100, "currency": "usd"}
+```
+→ Signature: `{amount:number,currency:string}` → `sha256[:16]`
+
+This preserves privacy (no PII in the chain) while detecting argument tampering.
+
+---
+
+## policy/ — Policy Engine
+
+Compiles YAML policies into executable bytecode and evaluates tool calls against them.
+
+### Engine Structure
+
+```go title="internal/core/policy/engine.go"
+type Engine struct {
+    doc      *Doc           // Parsed policy YAML
+    version  string         // SHA256 of policy content
+    programs []*vm.Program  // Compiled expr-lang bytecode (parallel to doc.Rules)
+}
+```
+
+### Policy Document Schema
+
+```go title="internal/core/reference/policy-yaml.go"
+type Doc struct {
+    FarameshVersion string              `yaml:"faramesh-version"`
+    AgentID         string              `yaml:"agent-id"`
+    DefaultEffect   string              `yaml:"default_effect"`
+    Vars            map[string]any      `yaml:"vars"`
+    Rules           []Rule              `yaml:"rules"`
+    Tools           map[string]ToolMeta `yaml:"tools"`
+    Budget          *Budget             `yaml:"budget"`
+    PostRules       []PostRule          `yaml:"post_rules"`
+    ContextGuards   []ContextGuard      `yaml:"context_guards"`
+}
+
+type Rule struct {
+    ID         string `yaml:"id"`
+    Match      Match  `yaml:"match"`
+    Effect     string `yaml:"effect"`
+    Reason     string `yaml:"reason"`
+    ReasonCode string `yaml:"reason_code"`
+}
+
+type Match struct {
+    Tool string `yaml:"tool"`  // Glob pattern: "stripe/*", "shell/run"
+    When string `yaml:"when"`  // expr-lang condition
+}
+```
+
+### Evaluation Algorithm
+
+```go
+func (e *Engine) Evaluate(toolID string, ctx EvalContext) EvalResult {
+    for i, rule := range e.doc.Rules {
+        // Step 1: Check tool pattern match
+        if !matchTool(rule.Match.Tool, toolID) {
+            continue
+        }
+
+        // Step 2: Evaluate when condition (if present)
+        if e.programs[i] != nil {
+            env := evalEnv(e.doc, &ctx)
+            out, err := vm.Run(e.programs[i], env)
+            if err != nil || out != true {
+                continue  // condition failed
+            }
+        }
+
+        // First match wins
+        return EvalResult{
+            Effect:     rule.Effect,
+            RuleID:     rule.ID,
+            ReasonCode: rule.ReasonCode,
+            Reason:     rule.Reason,
+        }
+    }
+
+    // No rule matched → apply default_effect
+    return EvalResult{Effect: e.doc.DefaultEffect}
+}
+```
+
+### Evaluation Context
+
+The `when:` expression has access to:
+
+```yaml
+args.*                  # Tool arguments (map[string]any)
+vars.*                  # Policy variables
+session.call_count      # Total calls in session
+session.history         # Array of recent tool calls
+session.cost_usd        # Session cost accumulator
+session.daily_cost_usd  # Daily cost (UTC calendar day)
+tool.reversibility      # "irreversible" | "reversible" | "compensatable"
+tool.blast_radius       # "none" | "local" | "scoped" | "system" | "external"
+tool.tags               # Array of string tags
+principal.id            # IDP-verified identity
+principal.tier          # SaaS tier (free, pro, enterprise)
+principal.role          # Organizational role
+principal.verified      # Whether identity is verified
+delegation.depth        # Delegation chain depth
+delegation.origin_agent # Root orchestrator agent ID
+time.hour               # 0-23 (UTC)
+time.weekday            # 1=Mon, 7=Sun
+```
+
+### Built-in Functions
+
+```yaml
+# History pattern detection
+history_contains_within("http/post", 120)  # Any HTTP POST in last 2min?
+history_sequence("read_file", "shell/exec", "http/post")  # Exfil pattern?
+history_tool_count("stripe/*") > 3  # More than 3 Stripe calls?
+deny_count_within(60) > 2  # Escalate if 2+ denies in last minute
+
+# Array helpers
+args_array_len("recipients") > 50
+args_array_contains("recipients", "ceo@company.com")
+args_array_any_match("recipients", "*@external.com")
+```
+
+---
+
+## session/ — Session State Management
+
+Tracks per-agent call counts, cost accumulators, and history ring buffer.
+
+### Manager & State
+
+```go title="internal/core/session/state.go"
+type Manager struct {
+    mu      sync.RWMutex
+    states  map[string]*State  // agentID → state
+    backend Backend            // memory | Redis
+}
+
+type State struct {
+    agentID    string
+    sessionID  string
+    callCount  atomic.Int64
+    costUSD    atomic.Uint64   // Float64 bits
+    dailyCost  atomic.Uint64
+    killed     atomic.Bool
+    historyMu  sync.Mutex
+    history    []HistoryEntry  // Fixed-size ring buffer
+    backend    Backend
+}
+```
+
+### History Entry
+
+```go
+type HistoryEntry struct {
+    ToolID    string
+    Effect    string  // PERMIT | DENY | DEFER
+    Timestamp time.Time
+}
+```
+
+### Operations
+
+```go
+// Atomic call count increment
+count := state.IncrCallCount()  // returns new value
+
+// Add cost to session and daily accumulators
+state.AddCost(0.15)  // $0.15
+
+// Record decision in history ring
+state.RecordHistory(toolID, "PERMIT")
+
+// Get recent history (newest first)
+history := state.History()  // []HistoryEntry
+
+// Kill switch
+state.Kill()
+if state.IsKilled() { /* deny all calls */ }
+```
+
+---
+
+## observe/ — Observability & Telemetry
+
+Metrics, structured logging, OpenTelemetry integration, and Policy Impact Estimation.
+
+### Metrics Collector
+
+```go title="internal/core/observe/metrics.go"
+type Collector struct {
+    decisionsTotal    map[string]int64  // effect → count
+    latencyHistogram  []time.Duration
+    walWrites         int64
+    walFailures       int64
+    mu                sync.Mutex
+}
+
+func (c *Collector) RecordDecision(effect, reasonCode string, latency time.Duration)
+func (c *Collector) RecordWALWrite(success bool)
+```
+
+### PIE — Policy Impact Estimation
+
+```go title="internal/core/observe/pie.go"
+// Run the current policy in shadow mode against historical traffic
+// to estimate impact before deployment.
+type PIEAnalysis struct {
+    TotalEvaluated   int
+    PermitCount      int
+    DenyCount        int
+    DeferCount       int
+    CounterfactualDenyCount int  // would-deny in production
+    EstimatedBlockRate      float64
+}
+```
+
+---
+
+## multiagent/ — Multi-Agent Orchestration
+
+Governance for agent swarms, sub-agent delegation, cross-agent budgets, and loop detection.
+
+### Key Modules
+
+```
+multiagent/
+├── aggregation.go    Cross-agent decision aggregation
+├── budget.go         Shared budget pools across agents
+├── linkage.go        Agent call graph tracking
+├── loops.go          Infinite loop detection
+├── routing.go        Inter-agent request routing
+├── seals.go          Cryptographic session seals
+├── sessiongov.go     Session-level governance
+├── subpolicy.go      Sub-agent policy delegation
+└── sync.go           Cross-agent state synchronization
+```
+
+Future documentation will cover these in detail.
+
+---
+
+## principal/ — Identity & Access
+
+Workload identity, SPIFFE integration, IDP verification, privilege elevation tracking.
+
+```go title="internal/core/principal/identity.go"
+type Identity struct {
+    ID       string  // IDP-verified identity (e.g., "user@company.com")
+    Tier     string  // "free" | "pro" | "enterprise"
+    Role     string  // "analyst" | "operator" | "admin"
+    Org      string  // Organization identifier
+    Verified bool    // Whether identity is cryptographically verified
+}
+```
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Pipeline Architecture" icon="diagram-project" href="/architecture/pipeline">
+    Understand the 11-step governance flow
+  </Card>
+  <Card title="Adapter Architecture" icon="plug" href="/concepts/adapters">
+    SDK, daemon, sidecar, serverless, MCP, eBPF
+  </Card>
+</CardGroup>

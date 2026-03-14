@@ -1,80 +1,346 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get from install to first governed function in 5 minutes
 ---
 
-## Get started in three steps
+## See It Work in 30 Seconds
 
-Get your documentation site running locally and make your first customization.
+Before building anything, see Faramesh in action with the built-in demo:
 
-### Step 1: Set up your local environment
+<Steps>
+  <Step title="Install Faramesh">
+    <CodeGroup>
+    ```bash macOS / Linux (Homebrew)
+    brew install faramesh/tap/faramesh
+    ```
+
+    ```bash macOS / Linux (curl)
+    curl -fsSL https://raw.githubusercontent.com/faramesh/faramesh-core/main/install.sh | sh
+    ```
+
+    ```bash Docker
+    docker pull ghcr.io/faramesh/faramesh:latest
+    ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="Run the demo">
+    ```bash
+    faramesh demo
+    ```
+
+    You'll see live governance decisions in your terminal:
+
+    ```
+    Faramesh — Unified Agent Governance
+    Starting synthetic agent with demo policy...
+
+    [10:00:15] PERMIT  get_exchange_rate      from=USD to=SEK              latency=11ms
+    [10:00:17] DENY    shell/run              cmd="rm -rf /"               scanner=SCANNER_DENY  latency=0ms
+    [10:00:18] PERMIT  read_customer          id=cust_abc123               latency=9ms
+    [10:00:20] DEFER   stripe/refund          amount=$12,000               awaiting approval  policy=defer-high-value-refund
+    [10:00:21] DENY    send_email             recipients=847               policy=deny-mass-email  latency=5ms
+
+    ─────────────────────────────────────────────
+    5 actions evaluated. 2 PERMIT  2 DENY  1 DEFER
+    ```
+
+    **Zero config. Zero infrastructure. PERMIT/DENY/DEFER in under 3 seconds.**
+  </Step>
+</Steps>
+
+---
+
+## Build Your First Governed Agent (5 minutes)
+
+Now let's build a real governed agent from scratch.
+
+<Steps>
+  <Step title="Create a policy file">
+    Create a new file called `payment.yaml`:
+
+    ```yaml payment.yaml
+    faramesh-version: '1.0'
+    agent-id: payment-bot
+    default_effect: permit
+
+    vars:
+      max_refund: 500
+
+    rules:
+      # Deny destructive shell commands — always.
+      - id: deny-destructive-shell
+        match:
+          tool: shell/run
+          when: 'args["cmd"] matches "rm\\s+-[rf]"'
+        effect: deny
+        reason: destructive shell command blocked by policy
+        reason_code: DESTRUCTIVE_SHELL_COMMAND
+
+      # Require human approval for high-value refunds.
+      - id: defer-high-value-refund
+        match:
+          tool: stripe/refund
+          when: 'args["amount"] > vars["max_refund"]'
+        effect: defer
+        reason: refund exceeds threshold — requires finance approval
+        reason_code: HIGH_VALUE_REFUND
+
+      # Deny mass email.
+      - id: deny-mass-email
+        match:
+          tool: send_email
+          when: 'len(args["recipients"]) > 50'
+        effect: deny
+        reason: mass email to >50 recipients requires manual review
+        reason_code: MASS_EMAIL_LIMIT
+    ```
+
+    <Note>
+      **Policy rules are evaluated in order.** First match wins. The `when` condition uses [expr-lang](https://github.com/expr-lang/expr) — a type-safe expression language that compiles to bytecode.
+    </Note>
+  </Step>
+
+  <Step title="Validate the policy">
+    Before using the policy, validate it to catch syntax errors:
+
+    ```bash
+    faramesh policy validate payment.yaml
+    ```
+
+    This command:
+    - Parses the YAML structure
+    - Validates rule definitions
+    - Compiles all `when` conditions to bytecode
+    - Exits 0 on success, 1 on error (perfect for CI pipelines)
+
+    <Tip>
+      Add this to your CI pipeline to prevent broken policies from reaching production.
+    </Tip>
+  </Step>
+
+  <Step title="Install the Python SDK">
+    ```bash
+    pip install faramesh
+    ```
+  </Step>
+
+  <Step title="Create your agent code">
+    Create `agent.py`:
+
+    ```python agent.py
+    from faramesh import govern, DenyError, DeferredError
+
+    # Define your agent functions
+    def stripe_refund(amount: float, currency: str) -> dict:
+        """Refund a charge via Stripe."""
+        print(f"[STRIPE] Refunding {currency.upper()} {amount}")
+        return {"status": "success", "amount": amount, "currency": currency}
+
+    def send_email(subject: str, recipients: list[str]) -> dict:
+        """Send an email."""
+        print(f"[EMAIL] Sending to {len(recipients)} recipients: {subject}")
+        return {"status": "sent", "count": len(recipients)}
+
+    # Wrap with governance
+    governed_refund = govern(
+        stripe_refund,
+        policy='payment.yaml',
+        agent_id='payment-bot'
+    )
+
+    governed_email = govern(
+        send_email,
+        policy='payment.yaml',
+        agent_id='payment-bot'
+    )
+
+    # Test the governed functions
+    if __name__ == "__main__":
+        # This will PERMIT (under threshold)
+        try:
+            result = governed_refund(amount=100, currency='usd')
+            print(f"✓ Refund successful: {result}")
+        except DenyError as e:
+            print(f"✗ DENY: {e.reason}")
+        except DeferredError as e:
+            print(f"⏸ DEFER: {e.reason}")
+            print(f"  Approve with: faramesh agent approve {e.defer_token}")
+
+        # This will DEFER (exceeds threshold)
+        try:
+            result = governed_refund(amount=12000, currency='usd')
+            print(f"✓ Refund successful: {result}")
+        except DeferredError as e:
+            print(f"⏸ DEFER: {e.reason}")
+            print(f"  Approve with: faramesh agent approve {e.defer_token}")
+
+        # This will DENY (too many recipients)
+        try:
+            recipients = [f"user{i}@example.com" for i in range(100)]
+            result = governed_email(subject="Test", recipients=recipients)
+            print(f"✓ Email sent: {result}")
+        except DenyError as e:
+            print(f"✗ DENY: {e.reason}")
+    ```
+
+    <Note>
+      **`govern()` auto-starts the daemon on first call.** No separate setup required in development mode.
+    </Note>
+  </Step>
+
+  <Step title="Run the agent">
+    ```bash
+    python agent.py
+    ```
+
+    You'll see:
+
+    ```
+    [STRIPE] Refunding USD 100
+    ✓ Refund successful: {'status': 'success', 'amount': 100, 'currency': 'usd'}
+    ⏸ DEFER: refund exceeds threshold — requires finance approval
+      Approve with: faramesh agent approve def_abc123xyz
+    ✗ DENY: mass email to >50 recipients requires manual review
+    ```
+
+    <Warning>
+      The second refund (\$12,000) will **block** waiting for approval. Press `Ctrl+C` to cancel, or approve it in the next step.
+    </Warning>
+  </Step>
+
+  <Step title="(Optional) Handle deferred actions">
+    In a **separate terminal**, stream live decisions:
+
+    ```bash
+    faramesh audit tail
+    ```
+
+    You'll see real-time governance decisions as your agent runs.
+
+    To approve a deferred action:
+
+    ```bash
+    faramesh agent approve def_abc123xyz
+    ```
+
+    To deny it:
+
+    ```bash
+    faramesh agent deny def_abc123xyz
+    ```
+
+    <Tip>
+      In production, you'd integrate this with Slack, PagerDuty, or a custom approval workflow.
+    </Tip>
+  </Step>
+
+  <Step title="Verify audit trail integrity">
+    Every decision is recorded in a tamper-evident DPR (Decision-Provenance Record) chain:
+
+    ```bash
+    faramesh audit verify ~/.faramesh/faramesh.db
+    ```
+
+    Output:
+
+    ```
+    ✓ Chain integrity verified. 3 records, 0 violations.
+    ```
+
+    Each record includes:
+    - SHA256 hash of this record
+    - SHA256 hash of the previous record (linked list)
+    - Policy version active at decision time
+    - Effect (PERMIT/DENY/DEFER/SHADOW)
+  </Step>
+</Steps>
+
+---
+
+## What Just Happened?
 
 <AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
+  <Accordion title="1. govern() wrapped your function">
+    The `govern()` decorator intercepts every function call **before** the underlying function executes. It:
+    - Serializes the function arguments into a `CanonicalActionRequest`
+    - Sends the request to the Faramesh daemon (auto-started on first call)
+    - Waits for a governance decision (PERMIT/DENY/DEFER)
+    - Raises an exception on DENY or DEFER timeout
+    - Executes the original function on PERMIT
   </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
+
+  <Accordion title="2. The daemon evaluated your policy">
+    The Faramesh daemon loaded `payment.yaml`, compiled the policy rules to bytecode, and evaluated each rule in order:
+    - **Rule 1 (deny-destructive-shell):** Doesn't match (tool is `stripe/refund`, not `shell/run`) → skip
+    - **Rule 2 (defer-high-value-refund):** Matches! `args["amount"] > 500` → DEFER
+    - No further rules evaluated (first match wins)
+  </Accordion>
+
+  <Accordion title="3. Decisions were recorded in the DPR chain">
+    Before returning each decision to your agent, Faramesh wrote a record to the **Write-Ahead Log (WAL)** and then asynchronously replicated it to the SQLite DPR chain.
+
+    This guarantees **no execution without an audit record** — even if the process crashes between the WAL write and the SQLite replication, the WAL replays on restart.
+  </Accordion>
+
+  <Accordion title="4. DEFER blocked waiting for approval">
+    When a rule returns `effect: defer`, the Python SDK enters a **DeferPollLoop** — polling the daemon every 2 seconds to check if the action has been approved or denied.
+
+    Default timeout: 5 minutes. After timeout, `DeferredError` is raised with `expired=True`.
   </Accordion>
 </AccordionGroup>
 
-### Step 2: Deploy your changes
+---
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+## LangChain Integration
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+Faramesh preserves LangChain `@tool` decorator metadata:
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+```python
+from langchain.tools import tool
+from faramesh import govern
 
-### Step 3: Go live
+@tool
+def stripe_refund(amount: float, currency: str) -> str:
+    """Refund a charge via Stripe."""
+    return f"Refunded {currency.upper()} {amount}"
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+govern_refund = govern(stripe_refund, policy='payment.yaml', agent_id='payment-bot')
+# LangChain tool metadata (name, description, args_schema) is fully preserved.
+```
 
-## Next steps
+---
 
-Now that you have your docs running, explore these key features:
+## Next Steps
 
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Installation Guide" icon="download" href="/installation">
+    Detailed installation instructions for all platforms (Homebrew, Docker, Go, Windows)
+  </Card>
+  <Card title="Policy Reference" icon="book" href="/policies/writing-policies">
+    Learn how to write advanced policies with variables, selectors, and external data
+  </Card>
+  <Card title="CLI Reference" icon="terminal" href="/cli/overview">
+    Explore all CLI commands (serve, audit, agent, policy, init)
+  </Card>
+  <Card title="Production Setup" icon="server" href="/deployment/production">
+    Deploy Faramesh in production (Kubernetes, Docker, Lambda)
+  </Card>
 </CardGroup>
 
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
+---
+
+## Common Commands
+
+```bash
+faramesh demo                              # See governance in action (30 seconds)
+faramesh init                              # Auto-detect env, generate config
+faramesh serve --policy policy.yaml        # Start the governance daemon
+faramesh policy validate policy.yaml       # Validate and lint a policy file
+faramesh policy inspect policy.yaml        # Show compiled policy summary
+faramesh audit tail                        # Stream live decisions
+faramesh audit verify faramesh.db          # Verify DPR chain SHA256 integrity
+faramesh agent approve <defer-token>       # Approve a pending DEFER
+faramesh agent deny <defer-token>          # Deny a pending DEFER
+faramesh agent kill <agent-id>             # Activate kill switch for an agent
+```

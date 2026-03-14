@@ -1,0 +1,199 @@
+---
+title: 'Threat Model'
+description: 'Faramesh security threat model and design guarantees'
+---
+
+## Overview
+
+Faramesh is designed as a **governance control plane** — a security-critical component that sits between AI agents and the actions they attempt to execute. The threat model addresses both **external threats** (malicious agents, prompt injection) and **internal threats** (policy bypass, audit tampering).
+
+## Threat Categories
+
+### 1. Malicious Agent Behavior
+
+**Threat**: An AI agent, compromised by prompt injection or adversarial input, attempts to execute destructive or unauthorized actions.
+
+**Mitigations**:
+- **Pre-execution scanners** detect dangerous patterns before policy evaluation:
+  - Destructive shell commands (`rm -rf`, `mkfs`, `dd if=`, shell bombs)
+  - Path traversal attempts (`../`, `%2e%2e`)
+  - SQL injection patterns
+  - Code execution in arguments (`eval()`, `exec()`, `__import__`)
+  - High-entropy secrets (AWS keys, API tokens, passwords)
+  - Sensitive file paths (`.env`, `.pem`, `id_rsa`, `/etc/passwd`)
+
+- **Policy evaluation** applies defense-in-depth rules
+- **DEFER workflow** routes high-risk actions to human approval
+- **Kill switch** (`faramesh agent kill <agent-id>`) immediately blocks all actions from a compromised agent
+
+See `/home/daytona/workspace/source/internal/core/pipeline.go:484-539` for scanner implementations.
+
+### 2. Policy Bypass Attempts
+
+**Threat**: An adversary attempts to circumvent governance by:
+- Unicode spoofing in tool IDs (`stripe/rėfund` vs `stripe/refund`)
+- Argument shape manipulation
+- Timing attacks or race conditions
+
+**Mitigations**:
+- **Canonical normalization** (CAR v1.0) applied to all requests:
+  - NFKC Unicode normalization prevents confusable character attacks
+  - Tool ID canonicalization (`pipeline.go:120-124`)
+  - Float rounding (6 significant figures) prevents precision abuse
+  - Null byte stripping, string trimming
+
+- **Deterministic evaluation**: Policy rules compile to bytecode at load time; evaluation order is consistent
+- **Structural signatures**: Only argument *shape* (key names, types) is hashed — values are never used for cache keys
+
+### 3. Audit Tampering
+
+**Threat**: An adversary with filesystem access attempts to:
+- Modify historical DPR records to hide malicious activity
+- Delete audit records to destroy evidence
+- Forge new records to implicate another agent
+
+**Mitigations**:
+- **Cryptographic chain integrity**: Each DPR record includes:
+  - `record_hash`: SHA256 of this record's canonical bytes
+  - `prev_record_hash`: Hash of the previous record (linked list)
+  - `policy_version`: Hash of the active policy at decision time
+
+- **Tamper detection**: `faramesh audit verify` recomputes hashes and detects breaks in the chain
+- **Write-ahead log (WAL)**: Append-only, fsync-on-write — no in-place edits possible
+- **Optional HMAC signatures**: Records can include HMAC-SHA256 signatures for non-repudiation
+
+See [Audit Trail](/security/audit-trail) for chain verification details.
+
+### 4. Availability Attacks
+
+**Threat**: An adversary floods the governance plane with requests to cause denial of service.
+
+**Mitigations**:
+- **Budget limits**: Per-session and daily call count / cost limits
+- **Fast-path evaluation**: Kill switch check is atomic (nanoseconds)
+- **Timeout-bounded selectors**: External data fetches have 10-second timeout
+- **Graceful degradation**: System can operate in STATELESS or MINIMAL mode if backend fails
+
+**User responsibility**: Deploy rate limiting at the reverse proxy layer (nginx, API gateway). Faramesh focuses on governance, not DoS protection.
+
+### 5. Privilege Escalation
+
+**Threat**: A low-privilege agent attempts to execute high-privilege actions or impersonate another agent.
+
+**Mitigations**:
+- **Principal identity verification**: `req.Principal.Verified` flag indicates cryptographic identity proof (SPIFFE, workload identity)
+- **Delegation scope enforcement**: Delegated tool calls are checked against allowed scopes (`pipeline.go:148-157`)
+- **Agent ID immutability**: Agent IDs are embedded in DPR records and cannot be forged within a session
+- **Context guards**: Policy can require fresh external context (e.g., "user still has admin role") before execution
+
+### 6. Insider Threats
+
+**Threat**: A malicious operator with access to the Faramesh daemon or database.
+
+**Mitigations**:
+- **Append-only WAL**: Even root cannot edit past records without breaking the chain
+- **Operator actions are logged**: `faramesh agent approve` creates DPR records with operator identity
+- **Separation of duties**: Policy files can be managed in version control with approval workflows
+- **External sync**: Faramesh Cloud Platform provides immutable off-system audit storage
+
+**Limitation**: A root user can kill the daemon and bypass governance. Deploy Faramesh in a privileged container or VM with restricted host access.
+
+## Trust Boundaries
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  UNTRUSTED                                                  │
+│  ┌───────────────────────────────────────────────────────┐ │
+│  │  AI Agent (LLM, tool executor, prompt input)          │ │
+│  │  • May be compromised by adversarial prompts          │ │
+│  │  • Cannot be trusted to self-regulate                 │ │
+│  └───────────────────────────────────────────────────────┘ │
+│                            │                                 │
+│                            ▼                                 │
+│  ┌───────────────────────────────────────────────────────┐ │
+│  │  Adapter (SDK, daemon client, MCP gateway)            │ │
+│  │  • Translates environment → CanonicalActionRequest    │ │
+│  │  • Enforces Decision (PERMIT/DENY/DEFER)              │ │
+│  └───────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+                            │
+        ════════════════════════════════════════
+                  TRUST BOUNDARY
+        ════════════════════════════════════════
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  TRUSTED COMPUTING BASE                                     │
+│                                                             │
+│  ┌───────────────────────────────────────────────────────┐ │
+│  │  Faramesh Core Pipeline                               │ │
+│  │  • Policy evaluation (expr-lang bytecode)             │ │
+│  │  • WAL-first audit recording                          │ │
+│  │  • Pre-execution scanners                             │ │
+│  │  • Budget enforcement                                 │ │
+│  └───────────────────────────────────────────────────────┘ │
+│                            │                                 │
+│  ┌───────────────────────────────────────────────────────┐ │
+│  │  Policy File (YAML + expr-lang)                       │ │
+│  │  • Defines PERMIT/DENY/DEFER rules                    │ │
+│  │  • Version-controlled, approved by security team      │ │
+│  └───────────────────────────────────────────────────────┘ │
+│                            │                                 │
+│  ┌───────────────────────────────────────────────────────┐ │
+│  │  DPR Store (SQLite / PostgreSQL)                      │ │
+│  │  • Tamper-evident audit chain                         │ │
+│  │  • Cryptographic integrity verification               │ │
+│  └───────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Security Assumptions
+
+Faramesh's security guarantees hold **only if** the following assumptions are met:
+
+1. **Policy integrity**: Policy files are protected by filesystem ACLs or version control approval workflows
+2. **Daemon isolation**: The `faramesh serve` process runs in a protected environment (container, VM, or privileged namespace)
+3. **Filesystem integrity**: The WAL and DPR database are on a filesystem with crash-consistent fsync semantics (ext4, XFS, ZFS — **not** NFS without sync mounts)
+4. **Time synchronization**: System clocks are synchronized (NTP) for accurate audit timestamps
+5. **Adapter trust**: The adapter correctly enforces DENY decisions and does not allow execution to proceed
+
+<Warning>
+**Critical**: If an adapter is compromised or incorrectly implemented, it may ignore DENY decisions. Always use official Faramesh adapters or thoroughly audit custom adapter code.
+</Warning>
+
+## Out of Scope
+
+The following threats are **out of scope** for Faramesh and must be addressed at other layers:
+
+- **Network-level DoS**: Use rate limiting proxies (nginx, Cloudflare)
+- **LLM jailbreaks**: Use input filtering and alignment at the LLM layer
+- **Data exfiltration via steganography**: Post-execution output scanning is experimental
+- **Hardware attacks**: Side-channel attacks, physical access to the server
+- **Supply chain attacks on dependencies**: Use `faramesh supply-chain verify` for SBOM auditing
+
+## Adversarial Testing
+
+Faramesh includes a 22-test adversarial suite (`internal/tests/adversarial/`) covering:
+- **Bypass attempts**: Unicode spoofing, timing attacks, cache poisoning
+- **Oracle testing**: Dual-engine verification of policy evaluation
+- **Double-guard enforcement**: Ensures DENY decisions cannot be overridden
+- **Property-based testing**: Invariant checks across random inputs
+
+Run the adversarial suite:
+```bash
+cd internal/tests/adversarial
+go test -v
+```
+
+## Reporting Security Issues
+
+See [SECURITY.md](https://github.com/faramesh/faramesh-core/blob/main/SECURITY.md) for responsible disclosure:
+- **Private reporting**: GitHub Security Advisories or security@faramesh.dev
+- **Acknowledgment**: Within 3 business days
+- **Coordinated disclosure**: We'll work with you on timing and credit
+
+## Related Documentation
+
+- [WAL Ordering Invariant](/security/wal-invariant) — Audit-first execution guarantee
+- [Audit Trail](/security/audit-trail) — DPR chain verification
+- [Compliance Exports](/security/compliance-exports) — SOC 2, HIPAA, EU AI Act reporting

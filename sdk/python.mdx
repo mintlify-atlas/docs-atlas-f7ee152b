@@ -1,0 +1,256 @@
+---
+title: "Python SDK"
+description: "Install and use the Faramesh Python SDK to add governance to your AI agents"
+icon: "python"
+---
+
+## Overview
+
+The Faramesh Python SDK provides a simple decorator-based interface for adding governance to any Python function. With one import and one decorator, you can enforce policies on tool calls in under 60 seconds.
+
+**Key features:**
+- **Zero infrastructure in development** — daemon auto-starts on first call
+- **Type-safe** — preserves function signatures, type hints, and docstrings
+- **Framework-agnostic** — works with LangChain, Pydantic, plain Python functions
+- **Minimal overhead** — governed calls typically add < 5ms latency
+
+## Installation
+
+<CodeGroup>
+```bash pip
+pip install faramesh
+```
+
+```bash poetry
+poetry add faramesh
+```
+
+```bash uv
+uv add faramesh
+```
+</CodeGroup>
+
+### Requirements
+
+- **Python 3.9+**
+- No mandatory dependencies (the daemon is a self-contained Go binary)
+
+### Optional dependencies
+
+For enhanced integration with popular frameworks:
+
+```bash
+# Pydantic model support
+pip install faramesh[pydantic]
+
+# LangChain @tool decorator support
+pip install faramesh[langchain]
+
+# All optional features
+pip install faramesh[all]
+```
+
+## Quick Start
+
+### Basic usage
+
+```python
+from faramesh import govern
+
+# Wrap any function with the govern decorator
+@govern
+def send_email(to: str, subject: str, body: str) -> dict:
+    """Send an email via SMTP."""
+    # Your implementation here
+    return {"status": "sent", "message_id": "..."}
+
+# Now every call is governed by your policy
+result = send_email(
+    to="ceo@example.com",
+    subject="Q4 Forecast",
+    body="Projected revenue: $5M"
+)
+```
+
+### With custom policy and agent ID
+
+```python
+from faramesh import govern
+import stripe
+
+# Specify a custom policy file and agent identity
+governed_refund = govern(
+    stripe.Refund.create,
+    policy="policies/payment.yaml",
+    agent_id="payment-bot"
+)
+
+# The governed function has the same signature as the original
+try:
+    refund = governed_refund(charge="ch_123", amount=5000)
+except DenyError as e:
+    print(f"Refund denied: {e.reason}")
+```
+
+### As a decorator with parameters
+
+```python
+from faramesh import govern
+
+@govern(policy="policies/database.yaml", tool_id="delete_user")
+def delete_user_account(user_id: str) -> bool:
+    """Permanently delete a user account."""
+    # Implementation
+    return True
+```
+
+## Response handling
+
+The governed function behaves exactly like the original, except it may raise governance exceptions:
+
+```python
+from faramesh import govern, DenyError, DeferredError
+
+@govern(policy="policy.yaml")
+def transfer_funds(from_account: str, to_account: str, amount: float):
+    # Transfer implementation
+    pass
+
+try:
+    transfer_funds("acct_123", "acct_456", 10000.0)
+except DenyError as e:
+    # Policy explicitly denied this call
+    print(f"Transfer denied by rule {e.rule_id}: {e.reason}")
+    # e.tool_id == "transfer_funds"
+    # e.reason_code == "AMOUNT_LIMIT_EXCEEDED"
+except DeferredError as e:
+    # Call was deferred for human approval, but timed out or was denied
+    print(f"Transfer requires approval: {e.reason}")
+    if e.expired:
+        print(f"Approval window expired. Token: {e.defer_token}")
+    else:
+        print(f"Approval was denied. Token: {e.defer_token}")
+```
+
+## Framework integration
+
+### LangChain
+
+The `govern()` decorator preserves LangChain's `@tool` metadata:
+
+```python
+from langchain_core.tools import tool
+from faramesh import govern
+
+@tool
+def search_database(query: str) -> list[dict]:
+    """Search the internal customer database."""
+    return [{"id": 1, "name": "Alice"}]
+
+# Wrap the LangChain tool
+governed_search = govern(search_database, policy="policy.yaml")
+
+# Tool metadata is preserved
+assert governed_search.name == "search_database"
+assert governed_search.description == "Search the internal customer database."
+```
+
+### Pydantic
+
+Pydantic models are automatically serialized for governance inspection:
+
+```python
+from pydantic import BaseModel
+from faramesh import govern
+
+class TransferRequest(BaseModel):
+    from_account: str
+    to_account: str
+    amount: float
+    currency: str = "USD"
+
+@govern(policy="policy.yaml")
+def process_transfer(request: TransferRequest) -> dict:
+    # Pydantic model is automatically serialized via .model_dump()
+    return {"status": "completed", "tx_id": "..."}
+
+request = TransferRequest(
+    from_account="acct_123",
+    to_account="acct_456",
+    amount=1000.0
+)
+result = process_transfer(request)
+```
+
+## Development vs. Production
+
+### Development mode (auto-start)
+
+By default, the SDK automatically downloads and starts the Faramesh daemon on the first `govern()` call:
+
+```python
+@govern(policy="policy.yaml", auto_start=True)  # default
+def my_tool():
+    pass
+
+# First call downloads the daemon binary and starts it
+my_tool()
+```
+
+The daemon binary is cached in `~/.faramesh/bin/` and reused for subsequent runs.
+
+### Production mode (managed daemon)
+
+In production, disable auto-start and manage the daemon separately:
+
+```python
+@govern(policy="policy.yaml", auto_start=False)
+def my_tool():
+    pass
+```
+
+Start the daemon manually:
+
+```bash
+faramesh serve --policy policy.yaml --socket /tmp/faramesh.sock
+```
+
+Or use a systemd service, Docker container, or Kubernetes deployment. See [Deployment](/deployment/daemon).
+
+## Type safety
+
+The `govern()` decorator preserves the original function's signature, type hints, and return type:
+
+```python
+def calculate(x: int, y: int) -> int:
+    return x + y
+
+governed = govern(calculate)
+
+# Type checkers see the same signature
+result: int = governed(5, 10)  # ✓ Type-safe
+```
+
+Access the original unwrapped function via `__wrapped__`:
+
+```python
+governed_func = govern(my_function)
+original = governed_func.__wrapped__
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="govern() decorator" icon="function" href="/sdk/govern-decorator">
+    Full API reference for the govern() decorator
+  </Card>
+  <Card title="Exception types" icon="triangle-exclamation" href="/sdk/exceptions">
+    Handle DenyError, DeferredError, and other exceptions
+  </Card>
+  <Card title="Configuration" icon="gear" href="/sdk/configuration">
+    Configure socket paths, timeouts, and daemon behavior
+  </Card>
+  <Card title="Write your first policy" icon="shield" href="/policies/writing-policies">
+    Learn how to write governance policies
+  </Card>
+</CardGroup>

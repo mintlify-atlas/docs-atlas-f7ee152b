@@ -1,97 +1,223 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Faramesh"
+description: "Unified governance plane for AI agents with pre-execution authorization, policy-as-code, and tamper-evident audit trail"
 ---
 
-## Setting up
+<div className="relative overflow-hidden rounded-lg p-12 mb-8" style={{background: "linear-gradient(135deg, rgba(132, 52, 244, 0.1) 0%, rgba(8, 15, 38, 0.9) 100%)", border: "1px solid rgba(132, 52, 244, 0.2)"}}>
+  <h1 className="text-5xl font-bold mb-4 text-white">Unified governance plane for AI agents</h1>
+  <p className="text-xl mb-6 text-gray-300">Pre-execution authorization · Policy-as-code · Tamper-evident audit trail</p>
+  
+  <div className="flex gap-4 mb-4">
+    <a href="/quickstart" className="inline-block px-6 py-3 rounded-md font-semibold" style={{background: "rgba(132, 52, 244, 1)", color: "#ffffff"}}>
+      Get Started
+    </a>
+    <a href="https://github.com/faramesh/faramesh-core" className="inline-block px-6 py-3 rounded-md font-semibold" style={{background: "rgba(48, 48, 96, 1)", color: "#ffffff"}}>
+      View on GitHub
+    </a>
+  </div>
+</div>
 
-Get your documentation site up and running in minutes.
+## See it work in 30 seconds
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+```bash
+# macOS / Linux with Homebrew
+brew install faramesh/tap/faramesh
 
-## Make it yours
+# or: curl -fsSL https://raw.githubusercontent.com/faramesh/faramesh-core/main/install.sh | sh
 
-Design a docs site that looks great and empowers your users.
+faramesh demo
+```
 
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+```
+Faramesh — Unified Agent Governance
+Starting synthetic agent with demo policy...
+
+[10:00:15] PERMIT  get_exchange_rate      from=USD to=SEK              latency=11ms
+[10:00:17] DENY    shell/run              cmd="rm -rf /"               scanner=SCANNER_DENY  latency=0ms
+[10:00:18] PERMIT  read_customer          id=cust_abc123               latency=9ms
+[10:00:20] DEFER   stripe/refund          amount=$12,000               awaiting approval  policy=defer-high-value-refund
+[10:00:21] DENY    send_email             recipients=847               policy=deny-mass-email  latency=5ms
+
+─────────────────────────────────────────────
+5 actions evaluated. 2 PERMIT  2 DENY  1 DEFER
+```
+
+<Note>Zero config. Zero infrastructure. PERMIT/DENY/DEFER in under 3 seconds.</Note>
+
+## Core Features
+
+<CardGroup cols={2}>
+  <Card title="Policy-as-Code" icon="file-code" href="/concepts/policy-engine">
+    Write governance rules in YAML with expr-lang expressions. Compile to bytecode for ~1μs evaluation.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="DEFER Workflow" icon="hand" href="/concepts/defer-workflow">
+    Human-in-the-loop approval for sensitive actions. Agents block until approved or timeout.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="DPR Chain" icon="link" href="/concepts/dpr-chain">
+    Tamper-evident Decision-Provenance Record chain. Every decision has a cryptographic audit trail.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Multi-Agent Governance" icon="users" href="/concepts/multi-agent">
+    Coordinate policies across agent swarms. Shared budgets, cross-agent state, and session governance.
   </Card>
-</Columns>
+  <Card title="Six Adapters" icon="plug" href="/concepts/adapters">
+    Deploy anywhere: SDK shim, daemon, sidecar, serverless, MCP gateway, or eBPF on Linux.
+  </Card>
+  <Card title="WAL-First Ordering" icon="shield" href="/security/wal-invariant">
+    No execution without audit record. fsync to disk before returning decision under all failure modes.
+  </Card>
+</CardGroup>
 
-## Create beautiful pages
+## Quick Integration
 
-Everything you need to create world-class documentation.
+<Tabs>
+  <Tab title="Python">
+    ```python
+    from faramesh import govern
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+    # Wrap any function with governance
+    governed_refund = govern(
+        stripe_refund, 
+        policy='payment.yaml', 
+        agent_id='payment-bot'
+    )
 
-## Need inspiration?
+    try:
+        result = governed_refund(amount=100, currency='usd')
+    except DenyError as e:
+        print(f"DENY: {e.reason}")
+    except DeferredError as e:
+        print(f"DEFER: approve with: faramesh agent approve {e.defer_token}")
+    ```
+  </Tab>
+  <Tab title="LangChain">
+    ```python
+    from langchain.tools import tool
+    from faramesh import govern
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+    @tool
+    def stripe_refund(amount: float, currency: str) -> str:
+        """Refund a charge via Stripe."""
+        ...
+
+    # LangChain metadata preserved
+    governed_refund = govern(
+        stripe_refund, 
+        policy='payment.yaml', 
+        agent_id='payment-bot'
+    )
+    ```
+  </Tab>
+  <Tab title="CLI Daemon">
+    ```bash
+    # Start the governance daemon
+    faramesh serve --policy payment.yaml
+
+    # In your agent code, calls to governed functions
+    # automatically connect to the daemon via Unix socket
+    ```
+  </Tab>
+</Tabs>
+
+## Policy Example
+
+```yaml payment.yaml
+faramesh-version: '1.0'
+agent-id: payment-bot
+default_effect: permit
+
+vars:
+  max_refund: 500
+
+rules:
+  # Deny destructive shell commands
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]"'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+
+  # Require human approval for high-value refunds
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold — requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+
+  # Deny mass email
+  - id: deny-mass-email
+    match:
+      tool: send_email
+      when: 'len(args["recipients"]) > 50'
+    effect: deny
+    reason: mass email requires manual review
+    reason_code: MASS_EMAIL_LIMIT
+```
+
+## Architecture Principle
+
+Every successful infrastructure control plane — Terraform, Vault, Datadog, OPA — was built on one architecture decision: **unified core + thin adapters**.
+
+Faramesh follows the same model. One policy language. One DPR chain. One governance pipeline. The adapter changes based on your environment — and `faramesh init` selects it automatically.
+
+<CardGroup cols={3}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install via Homebrew, Docker, or direct download
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get up and running in 5 minutes
+  </Card>
+  <Card title="CLI Reference" icon="terminal" href="/cli/overview">
+    Complete command-line interface documentation
+  </Card>
+</CardGroup>
+
+## The Faramesh Ecosystem
+
+Faramesh is a suite of standalone tools that work together as a unified governance plane:
+
+- **Core** — Pre-execution policy engine, DPR audit chain, DEFER workflow
+- **Tesseract** — Pre-governance observation for policy development
+- **Hub** — Open-source policy pack registry
+- **Sverm** — Cross-agent behavioral analysis and swarm governance
+- **CostShield** — Pre-execution cost governance to prevent runaway spend
+- **Supply Chain** — Cryptographic signing, SBOM, reproducible builds
+- **Cloud SDK** — Shared auth, plan gating, and inter-tool mesh connectivity
+
+All tools connect via the **Mesh** protocol. When multiple tools run on the same machine, they discover each other automatically and exchange data through authenticated Unix domain sockets.
+
+## Open Source + Cloud Model
+
+Every tool ships with **all features included** in the open-source distribution. Advanced capabilities are plan-gated via Faramesh Cloud:
+
+| Tier | What You Get | Auth Required? |
+|------|-------------|----------------|
+| **Community** | Full core functionality — policies, budgets, observation, signing, SBOM, delegation | No |
+| **Pro** | Cloud sync, rolling window budgets, cloud registry, cloud attestation | Yes (free account) |
+| **Team** | Anomaly detection, cost forecasting, private packs, cross-org swarm | Yes (Team plan) |
+| **Enterprise** | Fleet management, compliance exports, org-wide policies, fleet budgets | Yes (Enterprise plan) |
+
+```bash
+# Login to Faramesh Cloud for advanced features
+faramesh auth login
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Core Concepts" icon="book" href="/concepts/architecture">
+    Understand the architecture and design principles
+  </Card>
+  <Card title="Integration Guides" icon="code" href="/guides/python-sdk">
+    Integrate with Python, LangChain, Kubernetes, and more
+  </Card>
+  <Card title="Policy Development" icon="pencil" href="/policies/writing-policies">
+    Learn to write effective governance policies
+  </Card>
+  <Card title="Security & Compliance" icon="lock" href="/security/threat-model">
+    Explore security guarantees and compliance features
+  </Card>
+</CardGroup>

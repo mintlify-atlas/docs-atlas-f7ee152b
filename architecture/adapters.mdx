@@ -1,0 +1,551 @@
+---
+title: 'Adapter Architecture'
+description: 'SDK, daemon, sidecar, serverless, MCP, and eBPF adapter implementations'
+---
+
+## Architecture Principle
+
+Faramesh follows the **invariant core + thin adapters** pattern used by successful infrastructure tools (Terraform, Vault, Datadog):
+
+```
+┌──────────────────────── FARAMESH INVARIANT CORE ────────────────────────┐
+│  Pipeline │ DPR Chain │ Session State │ DEFER Workflow │ Policy Engine  │
+└────────────────────────────┬────────────────────────────────────────────┘
+                             │ CanonicalActionRequest + Decision
+                             │ (same format regardless of adapter)
+┌────────────────────────────▼────────────────────────────────────────────┐
+│                  ADAPTER STACK (auto-selected per environment)           │
+│                                                                          │
+│  A1: SDK Shim          A2: Local Daemon       A3: Sidecar + Proxy       │
+│  A4: Serverless        A5: MCP Gateway        A6: eBPF (Linux)          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+Every adapter has one job: **translate its environment into a `CanonicalActionRequest` and act on the `Decision`**.
+
+The core pipeline is identical across all adapters. A policy written for a Jupyter notebook works identically in production Kubernetes.
+
+---
+
+## A1: SDK Shim (Python/Node/Go)
+
+**Use Case**: Fastest on-ramp. Wrap any function with `govern()` and get governance in &lt;60 seconds.
+
+**Transport**: Unix domain socket (`/tmp/faramesh.sock`) with newline-delimited JSON.
+
+### Architecture
+
+```
+Python/Node/Go Process
+  └─ govern(tool_fn)
+       ├─ Submit CanonicalActionRequest via Unix socket
+       ├─ Block on response
+       ├─ If PERMIT: execute tool_fn()
+       ├─ If DENY: raise DenyError
+       └─ If DEFER: poll every 2s until approved/denied/expired
+```
+
+### Protocol
+
+**Client → Server**:
+```json
+{"type":"govern","call_id":"uuid","agent_id":"payment-bot","session_id":"sess123","tool_id":"stripe/refund","args":{"amount":100}}
+```
+
+**Server → Client**:
+```json
+{"call_id":"uuid","effect":"PERMIT","latency_ms":11}
+```
+
+### Python SDK Example
+
+```python
+from faramesh import govern
+
+# Auto-starts daemon on first call (zero config in dev)
+governed_refund = govern(stripe_refund, policy='payment.yaml', agent_id='bot')
+
+try:
+    result = governed_refund(amount=100, currency='usd')
+except DenyError as e:
+    print(f"DENY: {e.reason_code}")
+except DeferredError as e:
+    print(f"DEFER: approve with: faramesh agent approve {e.defer_token}")
+```
+
+### Implementation
+
+```go title="internal/adapter/sdk/server.go"
+type Server struct {
+    pipeline *core.Pipeline
+    listener net.Listener  // Unix socket
+}
+
+func (s *Server) handleConnection(conn net.Conn) {
+    scanner := bufio.NewScanner(conn)
+    writer := bufio.NewWriter(conn)
+
+    for scanner.Scan() {
+        var req governRequest
+        json.Unmarshal(scanner.Bytes(), &req)
+
+        car := core.CanonicalActionRequest{
+            CallID:           req.CallID,
+            AgentID:          req.AgentID,
+            SessionID:        req.SessionID,
+            ToolID:           req.ToolID,
+            Args:             req.Args,
+            Timestamp:        time.Now(),
+            InterceptAdapter: "sdk",
+        }
+
+        decision := s.pipeline.Evaluate(car)
+
+        resp := governResponse{
+            CallID:    req.CallID,
+            Effect:    string(decision.Effect),
+            LatencyMs: decision.Latency.Milliseconds(),
+        }
+        json.NewEncoder(writer).Encode(resp)
+        writer.Flush()
+    }
+}
+```
+
+**Daemon Lifecycle**: The SDK auto-starts the daemon on first `govern()` call if it's not running. In production, run as a systemd service.
+
+---
+
+## A2: Local Daemon (gRPC)
+
+**Use Case**: Multi-process shared governance. Multiple agent processes connect to a single daemon.
+
+**Transport**: gRPC over Unix socket or TCP with mTLS.
+
+### Architecture
+
+```
+Agent Process 1 ──┐
+Agent Process 2 ──┼─► gRPC ──► Daemon Process ──► Pipeline ──► Decision
+Agent Process 3 ──┘
+```
+
+### Service Definition
+
+```protobuf
+service FarameshDaemon {
+  rpc Govern(GovernRequest) returns (GovernResponse);
+  rpc PollDefer(PollDeferRequest) returns (PollDeferResponse);
+  rpc Health(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message GovernRequest {
+  string call_id = 1;
+  string agent_id = 2;
+  string session_id = 3;
+  string tool_id = 4;
+  string args_json = 5;  // JSON-encoded args map
+  bool wait_for_approval = 6;  // Block on DEFER until resolved?
+}
+```
+
+### Implementation
+
+```go title="internal/adapter/daemon/server.go"
+type Server struct {
+    pipeline *core.Pipeline
+    server   *grpc.Server
+    clients  map[string]time.Time  // agentID → last seen
+}
+
+func (s *Server) Govern(ctx context.Context, req *GovernRequest) (*GovernResponse, error) {
+    args := make(map[string]any)
+    json.Unmarshal([]byte(req.ArgsJson), &args)
+
+    car := core.CanonicalActionRequest{
+        CallID:           req.CallId,
+        AgentID:          req.AgentId,
+        SessionID:        req.SessionId,
+        ToolID:           req.ToolId,
+        Args:             args,
+        InterceptAdapter: "daemon",
+    }
+
+    decision := s.pipeline.Evaluate(car)
+
+    resp := &GovernResponse{
+        Effect:     string(decision.Effect),
+        ReasonCode: decision.ReasonCode,
+        DeferToken: decision.DeferToken,
+    }
+
+    // If DEFER and client wants to block: wait for approval
+    if decision.Effect == core.EffectDefer && req.WaitForApproval {
+        approved, err := s.waitForApproval(ctx, decision.DeferToken)
+        if approved {
+            resp.Effect = string(core.EffectPermit)
+        } else {
+            resp.Effect = string(core.EffectDeny)
+        }
+    }
+
+    return resp, nil
+}
+```
+
+**Health Checks**: The daemon implements gRPC health checks for Kubernetes liveness/readiness probes.
+
+---
+
+## A3: Sidecar + Transparent Proxy
+
+**Use Case**: Kubernetes deployments. Zero code changes. HTTP/gRPC traffic is intercepted at the network layer.
+
+### Architecture
+
+```
+Pod:
+  ┌─────────────────────┐
+  │ App Container       │
+  │   curl stripe.com   │──┐
+  └─────────────────────┘  │
+                           ├──► iptables NAT ──► Sidecar Container
+  ┌─────────────────────┐  │                        │
+  │ Faramesh Sidecar    │◄─┘                        │
+  │   Pipeline          │───────────────────────────┘
+  │   DPR Store         │    If PERMIT: forward to stripe.com
+  │   Session State     │    If DENY: return 403
+  └─────────────────────┘
+```
+
+### iptables Rules
+
+```bash
+# Redirect outbound HTTPS to sidecar proxy (port 15001)
+iptables -t nat -A OUTPUT -p tcp --dport 443 \
+  -m owner ! --uid-owner 1337 \
+  -j REDIRECT --to-port 15001
+
+# Redirect outbound HTTP to sidecar proxy (port 15000)
+iptables -t nat -A OUTPUT -p tcp --dport 80 \
+  -m owner ! --uid-owner 1337 \
+  -j REDIRECT --to-port 15000
+```
+
+UID 1337 is the sidecar's UID (excluded to prevent loops).
+
+### Helm Chart
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-agent
+spec:
+  template:
+    spec:
+      initContainers:
+      - name: faramesh-iptables
+        image: faramesh/iptables-init:latest
+        securityContext:
+          capabilities:
+            add: [NET_ADMIN]
+      containers:
+      - name: app
+        image: payment-agent:v1.0
+      - name: faramesh-sidecar
+        image: faramesh/sidecar:latest
+        args:
+          - "--policy=/config/policy.yaml"
+        volumeMounts:
+          - name: policy
+            mountPath: /config
+      volumes:
+        - name: policy
+          configMap:
+            name: faramesh-policy
+```
+
+**NetworkPolicy**: The sidecar enforces Kubernetes NetworkPolicy. If a tool is denied, the TCP connection is RST.
+
+---
+
+## A4: Serverless (Lambda/Cloud Run)
+
+**Use Case**: Serverless functions. Minimal cold-start overhead.
+
+### Architecture
+
+```
+Lambda Invocation
+  ├─ Handler: faramesh_handler(event, context)
+  │    ├─ Parse event → CanonicalActionRequest
+  │    ├─ Pipeline.Evaluate(car)
+  │    ├─ If PERMIT: invoke actual function
+  │    └─ If DENY: return error response
+  └─ Return result
+```
+
+### Lambda Layer
+
+```bash
+# Install Faramesh as a Lambda layer
+faramesh init --serverless lambda --layer-arn arn:aws:lambda:us-east-1:123456789012:layer:faramesh:1
+```
+
+### Handler Wrapper
+
+```python
+from faramesh.serverless import govern_lambda
+
+@govern_lambda(policy='s3://my-bucket/policy.yaml')
+def lambda_handler(event, context):
+    # Tool calls are governed automatically
+    return stripe.refund(amount=event['amount'])
+```
+
+### Implementation
+
+```go title="internal/adapter/serverless/handler.go"
+func Handler(pipeline *core.Pipeline, actualHandler func(any) any) func(any) any {
+    return func(event any) any {
+        // Parse event into CAR
+        car := eventToCAR(event)
+
+        decision := pipeline.Evaluate(car)
+
+        if decision.Effect == core.EffectPermit {
+            return actualHandler(event)
+        }
+
+        return ErrorResponse{
+            Error: decision.Reason,
+            Code:  decision.ReasonCode,
+        }
+    }
+}
+```
+
+**Cold Start Optimization**: Policy is compiled at init time and reused across warm invocations. DPR writes go to S3.
+
+---
+
+## A5: MCP Gateway (Model Context Protocol)
+
+**Use Case**: Govern Claude Desktop, Cursor, or any MCP client's tool usage.
+
+### Architecture
+
+```
+MCP Client (Claude Desktop)
+  │
+  ├─ tools/call {"name":"stripe_refund", "arguments":{"amount":100}}
+  │
+  ▼
+Faramesh MCP Gateway
+  ├─ Intercept: evaluate with pipeline
+  ├─ If PERMIT: forward to real MCP server
+  ├─ If DENY: return MCP error
+  └─ If DEFER: return "pending approval" + polling token
+  │
+  ▼
+Real MCP Server (e.g., Stripe MCP server)
+```
+
+### Configuration
+
+**Before** (Claude Desktop config):
+```json
+{
+  "mcpServers": {
+    "stripe": {
+      "command": "npx",
+      "args": ["-y", "@stripe/mcp-server"]
+    }
+  }
+}
+```
+
+**After** (with Faramesh governance):
+```json
+{
+  "mcpServers": {
+    "stripe": {
+      "command": "faramesh",
+      "args": ["mcp", "wrap", "--policy=policy.yaml", "--", "npx", "-y", "@stripe/mcp-server"]
+    }
+  }
+}
+```
+
+One-line change. Zero modifications to the MCP server or client.
+
+### Protocol Flow
+
+**MCP Client → Gateway**:
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stripe_refund","arguments":{"amount":100}}}
+```
+
+**Gateway → Real MCP Server** (if PERMIT):
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stripe_refund","arguments":{"amount":100}}}
+```
+
+**Gateway → Client** (if DENY):
+```json
+{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"governance denied: high-value refund requires approval"}}
+```
+
+### Implementation
+
+```go title="internal/adapter/mcp/gateway.go"
+type StdioGateway struct {
+    pipeline *core.Pipeline
+    agentID  string
+    cmd      *exec.Cmd       // Subprocess MCP server
+    stdin    io.WriteCloser
+    stdout   *bufio.Scanner
+}
+
+func (g *StdioGateway) handleToolCall(msg MCPMessage) (MCPMessage, error) {
+    var params toolCallParams
+    json.Unmarshal(msg.Params, &params)
+
+    car := core.CanonicalActionRequest{
+        AgentID:          g.agentID,
+        ToolID:           params.Name,
+        Args:             params.Arguments,
+        InterceptAdapter: "mcp",
+    }
+
+    decision := g.pipeline.Evaluate(car)
+
+    switch decision.Effect {
+    case core.EffectPermit:
+        return g.forwardToSubprocess(msg)  // pass through
+    case core.EffectDeny:
+        return errorResponse(msg.ID, -32000, decision.Reason), nil
+    case core.EffectDefer:
+        return deferResponse(msg.ID, decision.DeferToken), nil
+    }
+}
+```
+
+---
+
+## A6: eBPF Kernel Probes (Linux)
+
+**Use Case**: Zero-overhead syscall-level governance. Intercept `execve`, `connect`, `openat` before the kernel commits them.
+
+<Warning>
+eBPF adapter is experimental. Requires Linux kernel &gt;= 5.15 with BTF enabled.
+</Warning>
+
+### Architecture
+
+```
+Agent Process
+  │
+  ├─ execve("/bin/sh", ["-c", "rm -rf /"])
+  │
+  ▼
+eBPF Kprobe (kernel space)
+  ├─ Capture: pid, uid, cmdline
+  ├─ Send event to userspace via perf buffer
+  │
+  ▼
+Faramesh eBPF Agent (userspace)
+  ├─ Translate syscall → CanonicalActionRequest
+  ├─ Pipeline.Evaluate(car)
+  ├─ If DENY: kill process with SIGKILL
+  └─ If PERMIT: allow syscall to proceed
+```
+
+### eBPF Program
+
+```c title="internal/adapter/ebpf/probe.c"
+SEC("kprobe/sys_execve")
+int kprobe_execve(struct pt_regs *ctx) {
+    struct execve_event ev = {};
+    ev.pid = bpf_get_current_pid_tgid() >> 32;
+    ev.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    bpf_get_current_comm(&ev.comm, sizeof(ev.comm));
+    bpf_probe_read_user_str(&ev.filename, sizeof(ev.filename), (void *)PT_REGS_PARM1(ctx));
+
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &ev, sizeof(ev));
+    return 0;
+}
+```
+
+### Userspace Agent
+
+```go title="internal/adapter/ebpf/agent.go"
+func (a *Agent) handleExecveEvent(ev execveEvent) {
+    car := core.CanonicalActionRequest{
+        AgentID:          fmt.Sprintf("pid-%d", ev.PID),
+        ToolID:           "shell/exec",
+        Args:             map[string]any{"cmd": ev.Filename},
+        InterceptAdapter: "ebpf",
+    }
+
+    decision := a.pipeline.Evaluate(car)
+
+    if decision.Effect == core.EffectDeny {
+        syscall.Kill(int(ev.PID), syscall.SIGKILL)
+    }
+}
+```
+
+**Performance**: &lt;5μs overhead per syscall (measured on 5.15 kernel).
+
+---
+
+## Adapter Selection Matrix
+
+| Adapter | Latency | Code Changes | Use Case |
+|---------|---------|--------------|----------|
+| **A1: SDK** | 11ms | Wrap with `govern()` | Jupyter, scripts, dev |
+| **A2: Daemon** | 11ms | gRPC client | Multi-process apps |
+| **A3: Sidecar** | 15ms | Zero (iptables) | Kubernetes, service mesh |
+| **A4: Serverless** | 3ms | Handler wrapper | Lambda, Cloud Run |
+| **A5: MCP** | 11ms | Config change | Claude Desktop, Cursor |
+| **A6: eBPF** | 5μs | Zero (kernel) | High-security Linux |
+
+---
+
+## Auto-Detection
+
+```bash
+faramesh init --auto-detect
+```
+
+Detects environment and generates the correct adapter config:
+
+```go
+func AutoDetect() AdapterType {
+    if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+        return AdapterSidecar
+    }
+    if os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != "" {
+        return AdapterServerless
+    }
+    if os.Getenv("MCP_CLIENT_ID") != "" {
+        return AdapterMCP
+    }
+    return AdapterSDK  // default
+}
+```
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Pipeline Architecture" icon="diagram-project" href="/architecture/pipeline">
+    Understand the 11-step evaluation flow
+  </Card>
+  <Card title="Storage Backends" icon="database" href="/architecture/storage">
+    SQLite, PostgreSQL, Redis configuration
+  </Card>
+</CardGroup>

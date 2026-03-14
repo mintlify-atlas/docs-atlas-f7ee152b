@@ -1,0 +1,450 @@
+---
+title: Production Deployment
+description: Production-ready deployment, high availability, and persistence strategies
+---
+
+## Production Checklist
+
+<Steps>
+  <Step title="Version control your policy">
+    Store `policy.yaml` in Git. Track all changes.
+  </Step>
+  <Step title="Persistent data directory">
+    Use a persistent volume for `/var/lib/faramesh` (WAL + SQLite).
+  </Step>
+  <Step title="Service management">
+    Run daemon under systemd, Kubernetes, or container supervisor.
+  </Step>
+  <Step title="Enable metrics">
+    Expose Prometheus metrics on `--metrics-port`.
+  </Step>
+  <Step title="Regular audit verification">
+    Run `faramesh audit verify` daily to check chain integrity.
+  </Step>
+  <Step title="Backup strategy">
+    Back up the WAL file regularly (it's the authoritative audit log).
+  </Step>
+</Steps>
+
+## Recommended Daemon Command
+
+```bash
+faramesh serve \
+  --policy /etc/faramesh/policy.yaml \
+  --data-dir /var/lib/faramesh \
+  --socket /var/run/faramesh.sock \
+  --metrics-port 9108 \
+  --log-level info
+```
+
+## High Availability
+
+### Active-Passive HA
+
+Run two daemons: one active, one standby. Use a process manager (systemd, Kubernetes) to restart on failure.
+
+**Kubernetes Deployment:**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: faramesh
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: faramesh
+  template:
+    metadata:
+      labels:
+        app: faramesh
+    spec:
+      containers:
+        - name: faramesh
+          image: faramesh/faramesh:latest
+          args:
+            - serve
+            - --policy=/etc/faramesh/policy.yaml
+            - --data-dir=/var/lib/faramesh
+            - --grpc-port=50051
+            - --metrics-port=9108
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/faramesh
+          livenessProbe:
+            exec:
+              command: ["pgrep", "faramesh"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: faramesh-data
+```
+
+### Load Balancing
+
+For high-throughput scenarios, run multiple daemon instances behind a load balancer.
+
+<Warning>
+Each daemon must have its own data directory to maintain separate DPR chains. Use agent-specific routing or PostgreSQL for centralized DPR storage.
+</Warning>
+
+## Persistence Strategies
+
+### SQLite (Default)
+
+**Best for:** Single-node deployments, development
+
+```bash
+faramesh serve \
+  --policy policy.yaml \
+  --data-dir /var/lib/faramesh
+```
+
+Data files:
+- `faramesh.wal` — Write-Ahead Log (append-only, authoritative)
+- `faramesh.db` — SQLite DPR store (queryable index)
+
+See [sqlite.go:17-34](https://github.com/faramesh/faramesh-core/blob/main/internal/core/dpr/sqlite.go:17-34) for SQLite store implementation.
+
+### PostgreSQL (Recommended for Production)
+
+**Best for:** Multi-node deployments, centralized audit logs, high availability
+
+```bash
+faramesh serve \
+  --policy /etc/faramesh/policy.yaml \
+  --data-dir /var/lib/faramesh \
+  --dpr-dsn "postgres://user:pass@db.example.com:5432/faramesh?sslmode=require"
+```
+
+This enables **dual-write mode**:
+1. SQLite (local, fast queries)
+2. PostgreSQL (centralized, shared across daemons)
+
+See [postgres.go:24-39](https://github.com/faramesh/faramesh-core/blob/main/internal/core/dpr/postgres.go:24-39) for PostgreSQL store implementation.
+
+### PostgreSQL Schema
+
+The daemon automatically creates the schema:
+
+```sql
+CREATE TABLE dpr_records (
+  id BIGSERIAL PRIMARY KEY,
+  record_id TEXT NOT NULL UNIQUE,
+  agent_id TEXT NOT NULL,
+  tool_id TEXT NOT NULL,
+  effect TEXT NOT NULL,
+  matched_rule_id TEXT,
+  reason_code TEXT,
+  policy_version TEXT,
+  created_at TIMESTAMPTZ NOT NULL,
+  -- ... 40+ columns total
+);
+
+CREATE INDEX idx_dpr_agent_time ON dpr_records(agent_id, created_at);
+CREATE INDEX idx_dpr_effect ON dpr_records(effect, created_at);
+```
+
+See [postgres.go:230-289](https://github.com/faramesh/faramesh-core/blob/main/internal/core/dpr/postgres.go:230-289) for full schema.
+
+### Kubernetes PersistentVolume
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: faramesh-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: fast-ssd
+```
+
+## Backup Strategy
+
+### WAL Backup (Critical)
+
+The WAL is the authoritative audit log. Back it up regularly:
+
+```bash
+# Filesystem backup
+cp /var/lib/faramesh/faramesh.wal /backup/faramesh-$(date +%Y%m%d).wal
+
+# Cloud backup
+aws s3 cp /var/lib/faramesh/faramesh.wal \
+  s3://my-bucket/faramesh/wal/$(date +%Y%m%d)/faramesh.wal
+```
+
+### PostgreSQL Backup
+
+If using PostgreSQL:
+
+```bash
+pg_dump -h db.example.com -U faramesh -d faramesh -t dpr_records \
+  | gzip > faramesh-dpr-$(date +%Y%m%d).sql.gz
+```
+
+### Kubernetes CronJob Backup
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: faramesh-backup
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: backup
+              image: alpine:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  apk add aws-cli
+                  aws s3 cp /data/faramesh.wal \
+                    s3://backups/faramesh/$(date +%Y%m%d).wal
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+                  readOnly: true
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: faramesh-data
+          restartPolicy: OnFailure
+```
+
+## Scaling
+
+### Vertical Scaling
+
+Faramesh is extremely lightweight. For most workloads:
+
+| Load | CPU | Memory |
+|------|-----|--------|
+| Light (&lt;100 decisions/sec) | 100m | 128Mi |
+| Medium (100-1000 decisions/sec) | 250m | 256Mi |
+| Heavy (&gt;1000 decisions/sec) | 500m | 512Mi |
+
+Average decision latency: **&lt;1ms**
+
+### Horizontal Scaling
+
+For extreme throughput (&gt;10k decisions/sec):
+
+1. **Run multiple daemons** (each with its own data directory)
+2. **Use PostgreSQL** for centralized DPR storage
+3. **Load balance** by agent ID (consistent hashing)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: faramesh
+spec:
+  replicas: 5  # Scale horizontally
+  selector:
+    matchLabels:
+      app: faramesh
+  template:
+    spec:
+      containers:
+        - name: faramesh
+          args:
+            - serve
+            - --policy=/etc/faramesh/policy.yaml
+            - --dpr-dsn=postgres://...
+            - --grpc-port=50051
+```
+
+## Service Management
+
+### systemd Unit File
+
+```ini
+[Unit]
+Description=Faramesh Governance Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=faramesh
+Group=faramesh
+ExecStart=/usr/local/bin/faramesh serve \
+  --policy /etc/faramesh/policy.yaml \
+  --data-dir /var/lib/faramesh \
+  --socket /var/run/faramesh.sock \
+  --metrics-port 9108 \
+  --log-level info
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl enable faramesh
+sudo systemctl start faramesh
+sudo systemctl status faramesh
+```
+
+### Docker Compose
+
+```yaml
+version: '3.8'
+services:
+  faramesh:
+    image: faramesh/faramesh:latest
+    command:
+      - serve
+      - --policy=/etc/faramesh/policy.yaml
+      - --data-dir=/var/lib/faramesh
+      - --socket=/var/run/faramesh.sock
+      - --metrics-port=9108
+    volumes:
+      - ./policy.yaml:/etc/faramesh/policy.yaml:ro
+      - faramesh-data:/var/lib/faramesh
+      - faramesh-socket:/var/run
+    ports:
+      - "9108:9108"
+    restart: unless-stopped
+
+volumes:
+  faramesh-data:
+  faramesh-socket:
+```
+
+## Audit Verification
+
+Run daily to verify DPR chain integrity:
+
+```bash
+faramesh audit verify /var/lib/faramesh/faramesh.db
+```
+
+If using PostgreSQL:
+
+```bash
+faramesh audit verify --pg-dsn "postgres://user:pass@db:5432/faramesh"
+```
+
+### Automated Verification (Kubernetes CronJob)
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: faramesh-audit-verify
+spec:
+  schedule: "0 3 * * *"  # Daily at 3 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: verify
+              image: faramesh/faramesh:latest
+              command:
+                - faramesh
+                - audit
+                - verify
+                - /data/faramesh.db
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+                  readOnly: true
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: faramesh-data
+          restartPolicy: OnFailure
+```
+
+<Warning>
+If `audit verify` reports chain breaks, treat it as a **critical security incident**. Investigate immediately.
+</Warning>
+
+## Security Hardening
+
+### File Permissions
+
+```bash
+sudo chown -R faramesh:faramesh /var/lib/faramesh
+sudo chmod 700 /var/lib/faramesh
+sudo chmod 600 /var/lib/faramesh/faramesh.wal
+sudo chmod 600 /etc/faramesh/policy.yaml
+```
+
+### Socket Permissions
+
+```bash
+sudo chmod 770 /var/run/faramesh.sock
+sudo chown faramesh:agents /var/run/faramesh.sock
+```
+
+Only users in the `agents` group can connect.
+
+### Network Policies (Kubernetes)
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: faramesh-isolation
+spec:
+  podSelector:
+    matchLabels:
+      app: faramesh
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              faramesh-client: "true"
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres  # DPR storage
+```
+
+## Horizon Cloud Sync
+
+For centralized governance across multiple environments:
+
+```bash
+faramesh auth login
+faramesh serve --policy policy.yaml --sync-horizon
+```
+
+The daemon streams all DPR records to Faramesh Horizon in real time. Local operation continues even if Horizon is unreachable.
+
+See [daemon.go:225-234](https://github.com/faramesh/faramesh-core/blob/main/internal/daemon/daemon.go:225-234) for Horizon sync setup.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Monitoring" icon="chart-line" href="/deployment/monitoring">
+    Metrics, logs, and observability
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/deployment/troubleshooting">
+    Common issues and solutions
+  </Card>
+</CardGroup>

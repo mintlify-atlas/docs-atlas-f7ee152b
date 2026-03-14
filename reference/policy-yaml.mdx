@@ -1,0 +1,701 @@
+---
+title: Policy YAML Reference
+description: Complete reference for Faramesh Policy Language (FPL) v1.0 YAML schema
+---
+
+## Overview
+
+Faramesh policies are written in YAML using the **Faramesh Policy Language (FPL) v1.0**. Policy files define governance rules that control which tool calls are permitted, denied, or deferred to humans.
+
+Policies are compiled to bytecode at load time and evaluated at ~1μs per rule.
+
+## Document Structure
+
+<ParamField path="faramesh-version" type="string" required>
+  Policy language version. Must be `"1.0"`.
+  
+  ```yaml
+  faramesh-version: "1.0"
+  ```
+</ParamField>
+
+<ParamField path="agent-id" type="string" required>
+  Unique identifier for this agent. Used in logging, webhooks, and orchestration.
+  
+  ```yaml
+  agent-id: "customer-support-bot"
+  ```
+</ParamField>
+
+<ParamField path="vars" type="object">
+  Global variables accessible in all rule conditions via `vars.*`.
+  
+  ```yaml
+  vars:
+    max_refund_amount: 500
+    allowed_domains:
+      - "company.com"
+      - "trusted-partner.com"
+  ```
+</ParamField>
+
+<ParamField path="tools" type="object">
+  Tool metadata declarations. Each key is a tool ID; value is a [Tool](#tool-schema) object.
+  
+  ```yaml
+  tools:
+    stripe/refund:
+      reversibility: irreversible
+      blast_radius: high
+      tags: [financial]
+      cost_usd: 0.10
+  ```
+</ParamField>
+
+<ParamField path="phases" type="object">
+  Workflow phase definitions. Each key is a phase name; value is a [Phase](#phase-schema) object.
+  
+  ```yaml
+  phases:
+    research:
+      tools: ["http/get", "read_file"]
+      duration: "5m"
+      next: "execution"
+  ```
+</ParamField>
+
+<ParamField path="rules" type="array" required>
+  Ordered list of governance rules. Evaluated in document order; first match wins.
+  
+  See [Rule Schema](#rule-schema).
+</ParamField>
+
+<ParamField path="budget" type="object">
+  Cost and call limits enforced pre-execution.
+  
+  See [Budget Schema](#budget-schema).
+</ParamField>
+
+<ParamField path="session" type="object">
+  Session configuration (identity, expiry, history window).
+  
+  See [Session Schema](#session-schema).
+</ParamField>
+
+<ParamField path="default_effect" type="string" default="deny">
+  Effect applied when no rule matches. Valid values: `permit`, `deny`, `defer`.
+  
+  ```yaml
+  default_effect: deny
+  ```
+</ParamField>
+
+<ParamField path="context_guards" type="array">
+  Freshness checks for external context sources.
+  
+  See [Context Guards](#context-guard-schema).
+</ParamField>
+
+<ParamField path="webhooks" type="object">
+  Webhook configuration for policy events.
+  
+  See [Webhooks Schema](#webhook-schema).
+</ParamField>
+
+<ParamField path="max_output_bytes" type="integer">
+  Maximum tool output size in bytes. Outputs exceeding this limit are truncated.
+  
+  ```yaml
+  max_output_bytes: 1048576  # 1MB
+  ```
+</ParamField>
+
+<ParamField path="compensation" type="object">
+  Compensation/reversal mappings for tools.
+  
+  See [Compensation Schema](#compensation-schema).
+</ParamField>
+
+---
+
+## Rule Schema
+
+Rules define governance conditions and effects. Rules are evaluated in document order.
+
+<ParamField path="id" type="string" required>
+  Unique rule identifier. Used in logs, DPR events, and debugging.
+  
+  ```yaml
+  id: defer-high-value-refunds
+  ```
+</ParamField>
+
+<ParamField path="match" type="object" required>
+  Conditions that determine when this rule fires.
+  
+  <ParamField path="match.tool" type="string" required>
+    Tool ID pattern (supports globs: `*`, `stripe/*`, `shell/exec`).
+    
+    ```yaml
+    tool: "stripe/*"
+    ```
+  </ParamField>
+  
+  <ParamField path="match.when" type="string">
+    expr-lang expression evaluated against call context. Available variables:
+    - `args.*` - tool call arguments
+    - `vars.*` - policy global variables
+    - `session.*` - session context (call_count, history, cost_usd, daily_cost_usd)
+    - `tool.*` - tool metadata (reversibility, blast_radius, tags)
+    - `principal.*` - caller identity (id, tier, role, org, verified)
+    - `delegation.*` - delegation chain (depth, origin_agent, origin_org)
+    - `time.*` - temporal context (hour, weekday, month, day)
+    
+    ```yaml
+    when: "args.amount > vars.max_refund_amount"
+    ```
+  </ParamField>
+</ParamField>
+
+<ParamField path="effect" type="string" required>
+  Action to take when rule matches. See [Rule Effects Reference](/reference/rule-effects).
+  
+  Valid values: `permit`, `deny`, `defer`, `shadow`
+  
+  ```yaml
+  effect: defer
+  ```
+</ParamField>
+
+<ParamField path="reason" type="string">
+  Human-readable explanation shown to users and in logs.
+  
+  ```yaml
+  reason: "Refunds over $500 require human approval"
+  ```
+</ParamField>
+
+<ParamField path="reason_code" type="string">
+  Machine-readable code for programmatic handling.
+  
+  ```yaml
+  reason_code: HIGH_VALUE_REFUND
+  ```
+</ParamField>
+
+<ParamField path="incident_category" type="string">
+  Category for incident tracking and reporting.
+  
+  ```yaml
+  incident_category: financial_operations
+  ```
+</ParamField>
+
+<ParamField path="incident_severity" type="string">
+  Severity level for monitoring and alerting.
+  
+  Valid values: `low`, `medium`, `high`, `critical`
+  
+  ```yaml
+  incident_severity: high
+  ```
+</ParamField>
+
+### Example Rule
+
+```yaml
+rules:
+  - id: defer-high-value-stripe-refunds
+    match:
+      tool: "stripe/refund"
+      when: "args.amount > 500"
+    effect: defer
+    reason: "Refunds over $500 require human approval"
+    reason_code: HIGH_VALUE_REFUND
+    incident_category: financial_operations
+    incident_severity: high
+```
+
+---
+
+## Tool Schema
+
+Tool metadata declarations that enable risk-aware policy decisions.
+
+<ParamField path="reversibility" type="string">
+  Whether the tool's effects can be undone.
+  
+  Valid values:
+  - `reversible` - Effects can be easily undone
+  - `irreversible` - Effects are permanent
+  - `compensatable` - Effects can be reversed via compensation tool
+  
+  ```yaml
+  reversibility: irreversible
+  ```
+</ParamField>
+
+<ParamField path="blast_radius" type="string">
+  Scope of impact if tool is misused.
+  
+  Valid values:
+  - `none` - No lasting impact
+  - `local` - Affects single resource
+  - `scoped` - Affects related resources
+  - `system` - System-wide impact
+  - `external` - Impacts external systems/users
+  
+  Also accepts legacy values: `low`, `medium`, `high`
+  
+  ```yaml
+  blast_radius: external
+  ```
+</ParamField>
+
+<ParamField path="shadow_safe" type="boolean" default="false">
+  Whether this tool is safe to execute in SHADOW mode (no side effects).
+  
+  ```yaml
+  shadow_safe: true
+  ```
+</ParamField>
+
+<ParamField path="tags" type="array">
+  Arbitrary string tags for classification and filtering.
+  
+  ```yaml
+  tags: [financial, user-facing, gdpr]
+  ```
+</ParamField>
+
+<ParamField path="endpoint_pattern" type="string">
+  Pattern for validating tool endpoint/target (e.g., URL pattern for HTTP tools).
+  
+  ```yaml
+  endpoint_pattern: "https://*.company.com/*"
+  ```
+</ParamField>
+
+<ParamField path="cost_usd" type="number">
+  Estimated cost in USD per successful call. Used for budget enforcement.
+  
+  ```yaml
+  cost_usd: 0.15
+  ```
+</ParamField>
+
+### Example Tool Declaration
+
+```yaml
+tools:
+  stripe/refund:
+    reversibility: irreversible
+    blast_radius: external
+    shadow_safe: false
+    tags: [financial, customer-facing]
+    cost_usd: 0.25
+  
+  http/get:
+    reversibility: reversible
+    blast_radius: none
+    shadow_safe: true
+    tags: [read-only]
+    cost_usd: 0.01
+```
+
+---
+
+## Phase Schema
+
+Workflow phases scope which tools are visible to the agent at different stages.
+
+<ParamField path="tools" type="array" required>
+  List of tool IDs visible in this phase.
+  
+  ```yaml
+  tools:
+    - "http/get"
+    - "read_file"
+    - "search"
+  ```
+</ParamField>
+
+<ParamField path="duration" type="string">
+  Maximum phase duration (Go duration format: `5m`, `1h`, `30s`).
+  
+  ```yaml
+  duration: "10m"
+  ```
+</ParamField>
+
+<ParamField path="next" type="string">
+  Next phase to transition to when this phase completes.
+  
+  ```yaml
+  next: "execution"
+  ```
+</ParamField>
+
+### Example Phases
+
+```yaml
+phases:
+  research:
+    tools: ["http/get", "read_file", "search"]
+    duration: "5m"
+    next: "planning"
+  
+  planning:
+    tools: ["create_plan", "estimate_cost"]
+    duration: "2m"
+    next: "execution"
+  
+  execution:
+    tools: ["shell/exec", "http/post", "write_file"]
+    duration: "15m"
+```
+
+---
+
+## Budget Schema
+
+Cost and call limits enforced before tool execution.
+
+<ParamField path="daily_usd" type="number">
+  Maximum USD spend per calendar day (persisted across restarts).
+  
+  ```yaml
+  daily_usd: 100.00
+  ```
+</ParamField>
+
+<ParamField path="session_usd" type="number">
+  Maximum USD spend per session.
+  
+  ```yaml
+  session_usd: 10.00
+  ```
+</ParamField>
+
+<ParamField path="max_calls" type="integer">
+  Maximum total tool calls per session (all tools).
+  
+  ```yaml
+  max_calls: 500
+  ```
+</ParamField>
+
+<ParamField path="on_exceed" type="string" default="deny">
+  Effect when a limit is exceeded.
+  
+  Valid values: `deny`, `defer`
+  
+  ```yaml
+  on_exceed: defer
+  ```
+</ParamField>
+
+### Example Budget
+
+```yaml
+budget:
+  daily_usd: 50.00
+  session_usd: 5.00
+  max_calls: 100
+  on_exceed: defer
+```
+
+---
+
+## Session Schema
+
+Session configuration controls identity, expiry, and history tracking.
+
+<ParamField path="identity" type="string">
+  Session identity/principal identifier.
+  
+  ```yaml
+  identity: "user@company.com"
+  ```
+</ParamField>
+
+<ParamField path="expiry" type="duration">
+  Session expiration time (Go duration format).
+  
+  ```yaml
+  expiry: "1h"
+  ```
+</ParamField>
+
+<ParamField path="history_calls" type="integer">
+  Number of recent calls to retain in session history.
+  
+  ```yaml
+  history_calls: 50
+  ```
+</ParamField>
+
+<ParamField path="history_secs" type="integer">
+  Maximum age (in seconds) of calls to retain in history.
+  
+  ```yaml
+  history_secs: 3600  # 1 hour
+  ```
+</ParamField>
+
+### Example Session Config
+
+```yaml
+session:
+  identity: "${AGENT_PRINCIPAL}"
+  expiry: "2h"
+  history_calls: 100
+  history_secs: 7200
+```
+
+---
+
+## Context Guard Schema
+
+Context guards verify that external context is fresh and complete before high-stakes actions.
+
+<ParamField path="source" type="string" required>
+  Human-readable name for the context source.
+  
+  ```yaml
+  source: "customer-database"
+  ```
+</ParamField>
+
+<ParamField path="endpoint" type="string" required>
+  HTTP URL to check for context freshness.
+  
+  ```yaml
+  endpoint: "https://api.company.com/context/customer"
+  ```
+</ParamField>
+
+<ParamField path="required_fields" type="array">
+  Fields that must be present in the context response.
+  
+  ```yaml
+  required_fields:
+    - "account_id"
+    - "tier"
+    - "status"
+  ```
+</ParamField>
+
+<ParamField path="max_age_seconds" type="integer">
+  Maximum age (in seconds) before context is considered stale.
+  
+  ```yaml
+  max_age_seconds: 300  # 5 minutes
+  ```
+</ParamField>
+
+<ParamField path="on_stale" type="string" default="defer">
+  Effect when context is stale.
+  
+  Valid values: `deny`, `defer`
+  
+  ```yaml
+  on_stale: defer
+  ```
+</ParamField>
+
+<ParamField path="on_missing" type="string" default="defer">
+  Effect when required fields are missing.
+  
+  ```yaml
+  on_missing: deny
+  ```
+</ParamField>
+
+<ParamField path="on_inconsistent" type="string" default="defer">
+  Effect when context values are contradictory.
+  
+  ```yaml
+  on_inconsistent: defer
+  ```
+</ParamField>
+
+---
+
+## Webhook Schema
+
+Webhook delivery configuration for policy events.
+
+<ParamField path="url" type="string" required>
+  Destination URL for webhook POST requests.
+  
+  ```yaml
+  url: "https://webhooks.company.com/faramesh"
+  ```
+</ParamField>
+
+<ParamField path="events" type="array" required>
+  List of event types that trigger webhook delivery.
+  
+  Valid values: `deny`, `defer`, `defer_resolved`, `permit`, `policy_activated`, `kill_switch`
+  
+  ```yaml
+  events:
+    - defer
+    - deny
+    - kill_switch
+  ```
+</ParamField>
+
+<ParamField path="secret" type="string">
+  HMAC-SHA256 signing secret for webhook payload authentication.
+  
+  ```yaml
+  secret: "${WEBHOOK_SECRET}"
+  ```
+</ParamField>
+
+<ParamField path="timeout_ms" type="integer" default="5000">
+  HTTP timeout for webhook delivery in milliseconds.
+  
+  ```yaml
+  timeout_ms: 3000
+  ```
+</ParamField>
+
+---
+
+## Compensation Schema
+
+Defines how a tool's actions can be reversed or compensated.
+
+<ParamField path="compensation_tool" type="string" required>
+  Tool ID to call for reversal.
+  
+  ```yaml
+  compensation_tool: "stripe/cancel_refund"
+  ```
+</ParamField>
+
+<ParamField path="arg_mapping" type="object" required>
+  Maps compensation tool arguments from original action result.
+  
+  Keys are compensation arg names; values are JSONPath expressions into the original result.
+  
+  ```yaml
+  arg_mapping:
+    refund_id: "$.id"
+    reason: "$.metadata.reason"
+  ```
+</ParamField>
+
+### Example Compensation
+
+```yaml
+compensation:
+  stripe/refund:
+    compensation_tool: "stripe/cancel_refund"
+    arg_mapping:
+      refund_id: "$.id"
+      charge_id: "$.charge"
+```
+
+---
+
+## Complete Example
+
+```yaml
+faramesh-version: "1.0"
+agent-id: "customer-support-bot"
+
+vars:
+  max_refund_amount: 500
+  business_hours_only: true
+
+tools:
+  stripe/refund:
+    reversibility: irreversible
+    blast_radius: external
+    tags: [financial, customer-facing]
+    cost_usd: 0.25
+  
+  http/get:
+    reversibility: reversible
+    blast_radius: none
+    shadow_safe: true
+    cost_usd: 0.01
+  
+  shell/exec:
+    reversibility: irreversible
+    blast_radius: system
+    tags: [dangerous]
+    cost_usd: 0.05
+
+budget:
+  daily_usd: 50.00
+  session_usd: 5.00
+  max_calls: 100
+  on_exceed: defer
+
+session:
+  expiry: "2h"
+  history_calls: 100
+  history_secs: 7200
+
+rules:
+  - id: permit-safe-reads
+    match:
+      tool: "http/get"
+    effect: permit
+    reason: "Safe read-only HTTP requests"
+  
+  - id: defer-high-value-refunds
+    match:
+      tool: "stripe/refund"
+      when: "args.amount > vars.max_refund_amount"
+    effect: defer
+    reason: "Refunds over $500 require approval"
+    reason_code: HIGH_VALUE_REFUND
+    incident_severity: high
+  
+  - id: defer-shell-commands
+    match:
+      tool: "shell/*"
+    effect: defer
+    reason: "Shell execution requires approval"
+    reason_code: SHELL_EXECUTION
+    incident_severity: critical
+  
+  - id: default-deny
+    match:
+      tool: "*"
+    effect: deny
+    reason: "No matching rule"
+
+default_effect: deny
+
+webhooks:
+  url: "https://webhooks.company.com/faramesh"
+  events: [defer, deny, kill_switch]
+  secret: "${WEBHOOK_SECRET}"
+  timeout_ms: 3000
+```
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Rule Effects" icon="gavel" href="/reference/rule-effects">
+    Learn about PERMIT, DENY, DEFER, and SHADOW effects
+  </Card>
+  <Card title="Tool Metadata" icon="wrench" href="/reference/tool-metadata">
+    Understand reversibility and blast radius
+  </Card>
+  <Card title="Session State" icon="database" href="/reference/session-state">
+    Session history and counter APIs
+  </Card>
+  <Card title="External Selectors" icon="plug" href="/reference/selectors">
+    Extend policies with custom data sources
+  </Card>
+</CardGroup>

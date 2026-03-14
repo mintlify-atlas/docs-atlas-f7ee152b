@@ -1,0 +1,319 @@
+---
+title: 'faramesh init'
+description: 'Auto-detect your environment and generate Faramesh configuration'
+---
+
+## Overview
+
+`faramesh init` detects your runtime environment (Python, Kubernetes, Docker, Lambda, MCP) and generates the exact configuration needed to get governed agents running.
+
+**One command. Smart detection. Environment-specific setup files.**
+
+## Usage
+
+```bash
+faramesh init
+```
+
+## Flags
+
+<ParamField path="--auto-detect" type="boolean" default="true">
+  Automatically detect the runtime environment
+</ParamField>
+
+## What It Does
+
+1. **Detects your environment** — Scans for Python, Node.js, kubectl, Docker, Helm, Lambda, MCP
+2. **Recommends adapter** — Selects the best governance adapter for your stack
+3. **Generates configuration** — Creates `faramesh/policy.yaml` and environment-specific setup files
+4. **Provides next steps** — Shows exact commands to get started
+
+## Environment Detection
+
+Faramesh detects and recommends the optimal adapter:
+
+### Kubernetes (A3 - Sidecar)
+If `kubectl` is available:
+```text
+✓ Detected: Kubernetes cluster (kubectl available)
+✓ Detected: Helm
+
+Recommended adapter: A3 (Sidecar + Transparent Proxy)
+Reason: Kubernetes environment detected; Helm available for one-command deployment
+```
+
+Generates:
+- `faramesh/policy.yaml`
+- `faramesh/faramesh-values.yaml` (Helm chart values)
+- `faramesh/networkpolicy.yaml` (Kubernetes NetworkPolicy)
+
+### AWS Lambda (A4 - Lambda Layer)
+If `AWS_LAMBDA_FUNCTION_NAME` environment variable exists:
+```text
+✓ Detected: AWS Lambda environment
+
+Recommended adapter: A4 (Serverless / Lambda Layer)
+Reason: AWS Lambda environment detected
+```
+
+Generates:
+- `faramesh/policy.yaml`
+- `faramesh/layer-config.json` (Lambda Layer ARN + env vars)
+
+### MCP Server (A5 - MCP Gateway)
+If `MCP_SERVER` environment variable exists:
+```text
+✓ Detected: MCP server
+
+Recommended adapter: A5 (MCP Gateway)
+Reason: MCP_SERVER environment variable detected
+```
+
+### Docker (A2 - Local Daemon)
+If Docker is available:
+```text
+✓ Detected: Docker
+
+Recommended adapter: A2 (Local Daemon + Docker Compose)
+Reason: Docker available; daemon runs as a compose service
+```
+
+Generates:
+- `faramesh/policy.yaml`
+- `faramesh/docker-compose.yml` (Compose service definition)
+
+### Python SDK (A1 - SDK Shim)
+Default if no orchestration detected:
+```text
+✓ Detected: Python 3.11.5 agent
+
+Recommended adapter: A1 (SDK Shim — zero infrastructure)
+Reason: No orchestration layer detected; SDK shim is the fastest path to governance
+```
+
+Generates:
+- `faramesh/policy.yaml`
+
+## Example Output
+
+```bash
+$ faramesh init
+
+Faramesh 1.0.0 — Unified Governance Plane
+Detecting your environment...
+
+  ✓ Detected: Python 3.11.5 agent
+  ✓ Detected: Docker
+  ✗ Kubernetes cluster (kubectl available) (optional)
+  ✗ Helm (optional)
+  ✗ AWS Lambda environment (optional)
+  ✗ MCP server (optional)
+
+Recommended adapter: A2 (Local Daemon + Docker Compose)
+Reason: Docker available; daemon runs as a compose service
+
+Generating configuration...
+
+  faramesh/
+    policy.yaml         ← Policy file (edit this)
+    docker-compose.yml  ← Compose snippet to add faramesh service
+
+Next steps:
+
+  1. Edit faramesh/policy.yaml
+  2. faramesh run --policy faramesh/policy.yaml -- python agent.py
+
+Tip: Start in observation mode first:
+  faramesh serve --policy faramesh/policy.yaml
+
+Run the demo to see governance in action:
+  faramesh demo
+
+✓ Created faramesh/policy.yaml
+```
+
+## Generated Policy Skeleton
+
+The `faramesh/policy.yaml` skeleton includes common governance patterns:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: my-agent
+default_effect: permit
+
+vars:
+  max_refund: 500
+
+rules:
+  # Deny destructive shell commands.
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs"'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+
+  # Require approval for high-value operations.
+  - id: defer-high-value
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: high-value operation requires human approval
+    reason_code: HIGH_VALUE_THRESHOLD
+```
+
+## Next Steps by Environment
+
+### Python (A1)
+```bash
+# 1. Edit policy
+vim faramesh/policy.yaml
+
+# 2. Validate
+faramesh policy validate faramesh/policy.yaml
+
+# 3. Use in your agent
+from faramesh import govern
+governed_tool = govern(my_tool, policy='faramesh/policy.yaml')
+
+# 4. Stream decisions
+faramesh audit tail
+```
+
+### Kubernetes (A3)
+```bash
+# 1. Edit policy
+vim faramesh/policy.yaml
+
+# 2. Validate
+faramesh policy validate faramesh/policy.yaml
+
+# 3. Create ConfigMap
+kubectl create configmap faramesh-policy --from-file=faramesh/policy.yaml
+
+# 4. Install sidecar
+helm install faramesh faramesh/faramesh-sidecar -f faramesh/faramesh-values.yaml
+
+# 5. Label deployment
+kubectl label deployment my-agent faramesh.io/inject=true
+
+# 6. Stream decisions
+faramesh audit tail
+```
+
+### Docker (A2)
+```bash
+# 1. Edit policy
+vim faramesh/policy.yaml
+
+# 2. Run with wrapper
+faramesh run --policy faramesh/policy.yaml -- python agent.py
+```
+
+### AWS Lambda (A4)
+```bash
+# 1. Edit policy
+vim faramesh/policy.yaml
+
+# 2. Store in AWS SSM
+aws ssm put-parameter --name /faramesh/policy --value "$(cat faramesh/policy.yaml)"
+
+# 3. Add Lambda layer and set FARAMESH_POLICY_SSM=/faramesh/policy
+```
+
+## Use Cases
+
+### 1. New Projects
+Get started with Faramesh in under 1 minute:
+```bash
+faramesh init
+vim faramesh/policy.yaml  # Edit rules
+faramesh serve --policy faramesh/policy.yaml
+```
+
+### 2. Multi-Environment Projects
+Run `init` in each environment to get environment-specific config:
+```bash
+# Development (local)
+faramesh init  # → A1 (SDK Shim)
+
+# Staging (Docker)
+faramesh init  # → A2 (Docker Compose)
+
+# Production (Kubernetes)
+faramesh init  # → A3 (Sidecar)
+```
+
+### 3. Migration to Faramesh
+Generate config for existing agents:
+```bash
+faramesh init
+# Review generated policy.yaml
+# Customize rules for your tools
+```
+
+## Customization
+
+### Skip Existing Files
+`faramesh init` will **not** overwrite existing `faramesh/policy.yaml`. To regenerate:
+
+```bash
+rm faramesh/policy.yaml
+faramesh init
+```
+
+### Custom Policy Location
+Move the generated policy anywhere:
+
+```bash
+mv faramesh/policy.yaml policies/production.yaml
+faramesh serve --policy policies/production.yaml
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Wrong adapter detected">
+    The detection is based on available tools and environment variables. You can override by manually selecting config files:
+    
+    ```bash
+    # Use SDK shim even if Docker is available
+    faramesh serve --policy faramesh/policy.yaml
+    ```
+  </Accordion>
+  
+  <Accordion title="No environment detected">
+    If no specific environment is detected, Faramesh defaults to **A1 (SDK Shim)**, which works everywhere:
+    
+    ```bash
+    from faramesh import govern
+    governed_tool = govern(my_tool)
+    ```
+  </Accordion>
+  
+  <Accordion title="Want to use a different adapter">
+    You're not locked into the recommended adapter. Check the [Adapter Architecture](/concepts/adapters) docs for all options.
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Write Your Policy" icon="file-code" href="/policies/writing-policies">
+    Learn the Faramesh Policy Language (FPL)
+  </Card>
+  
+  <Card title="Validate Policy" icon="check" href="/cli/policy">
+    Use `faramesh policy validate` to check syntax
+  </Card>
+  
+  <Card title="Start the Daemon" icon="server" href="/cli/serve">
+    Launch governance with `faramesh serve`
+  </Card>
+  
+  <Card title="Stream Decisions" icon="activity" href="/cli/audit">
+    Watch live decisions with `faramesh audit tail`
+  </Card>
+</CardGroup>

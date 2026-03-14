@@ -1,0 +1,490 @@
+---
+title: Testing Policies
+description: Validate, test, and debug policies before deployment
+icon: flask
+---
+
+Faramesh provides CLI tools to validate and test policies **before** deploying them to production. This page covers the policy testing workflow.
+
+## Policy Validation
+
+Always validate policies before deployment:
+
+```bash
+faramesh policy validate policies/payment.yaml
+```
+
+### What Validation Checks
+
+<Check>YAML syntax correctness</Check>
+<Check>All `when:` expressions compile</Check>
+<Check>No duplicate rule IDs</Check>
+<Check>Valid effect values (`permit`, `deny`, `defer`, `shadow`)</Check>
+<Check>Tool pattern coverage (warns about unreachable rules)</Check>
+
+### Example Output
+
+**Valid policy:**
+
+```bash
+✓ policies/payment.yaml  [a3f2b1c0]  5 rules  agent=payment-agent
+```
+
+**Policy with errors:**
+
+```bash
+✗ rule "defer-high-value": invalid when expression: 
+  undefined variable "ammount" (did you mean "amount"?)
+✗ rule[3]: missing id
+```
+
+**Policy with warnings:**
+
+```bash
+⚠ warning: rule "permit-small-refund" (index 2, tool="stripe/refund") may be unreachable:
+  earlier rule "permit-all-stripe" (index 1, tool="stripe/*") matches all the same tools
+✓ policies/payment.yaml  [a3f2b1c0]  5 rules  agent=payment-agent  (1 warning(s))
+```
+
+<Info>
+Validation warnings indicate rules that may never fire due to earlier catch-all patterns. These are usually mistakes.
+</Info>
+
+## Policy Testing
+
+Test individual tool calls against a policy **without running the daemon**:
+
+```bash
+faramesh policy test policy.yaml --tool <tool-id> --args '<json-args>'
+```
+
+### Example: Test High-Value Refund
+
+```bash
+faramesh policy test policies/payment.yaml \
+  --tool stripe/refund \
+  --args '{"amount":600,"currency":"USD"}'
+```
+
+**Output:**
+
+```
+  Tool:    stripe/refund
+  Effect:  DEFER
+  Rule:    defer-high-value-refund
+  Reason:  refund exceeds threshold and requires finance approval
+  Code:    HIGH_VALUE_REFUND
+```
+
+### Example: Test Normal Refund
+
+```bash
+faramesh policy test policies/payment.yaml \
+  --tool stripe/refund \
+  --args '{"amount":100,"currency":"USD"}'
+```
+
+**Output:**
+
+```
+  Tool:    stripe/refund
+  Effect:  PERMIT
+  Rule:    permit-normal-refund
+  Reason:  refund within authorized threshold
+  Code:    WITHIN_THRESHOLD
+```
+
+### Example: Test Destructive Shell Command
+
+```bash
+faramesh policy test policies/security.yaml \
+  --tool shell/run \
+  --args '{"cmd":"rm -rf /data"}'
+```
+
+**Output:**
+
+```
+  Tool:    shell/run
+  Effect:  DENY
+  Rule:    deny-destructive-shell
+  Reason:  destructive shell command blocked by policy
+  Code:    DESTRUCTIVE_SHELL_COMMAND
+```
+
+### JSON Output
+
+Get structured JSON output for automation:
+
+```bash
+faramesh policy test policy.yaml \
+  --tool stripe/refund \
+  --args '{"amount":600}' \
+  --json
+```
+
+**Output:**
+
+```json
+{
+  "effect": "DEFER",
+  "rule_id": "defer-high-value-refund",
+  "reason": "refund exceeds threshold and requires finance approval",
+  "reason_code": "HIGH_VALUE_REFUND",
+  "tool_id": "stripe/refund"
+}
+```
+
+## Policy Inspection
+
+View a policy summary:
+
+```bash
+faramesh policy inspect policy.yaml
+```
+
+**Example output:**
+
+```
+Policy: policies/demo.yaml
+  version    : a3f2b1c04df8e921
+  agent-id   : demo-agent
+  fpl        : 1.0
+  rules      : 4
+  tools      : 5 declared
+  default    : permit
+
+Rules:
+  deny      deny-destructive-shell          tool=shell/run  when="args[...]"
+  defer     defer-high-value-refund          tool=stripe/refund  when="args[...]"
+  permit    permit-normal-refund             tool=stripe/refund  when="args[...]"
+  deny      default-deny                     tool=*
+```
+
+## Policy Diff
+
+Compare two policy versions before deployment:
+
+```bash
+faramesh policy diff policies/v1.yaml policies/v2.yaml
+```
+
+**Example output:**
+
+```
+Policy diff
+  old: policies/v1.yaml  [a3f2b1c0]  4 rules
+  new: policies/v2.yaml  [f8e9d1a2]  5 rules
+
+  + defer-weekend-operations         defer
+  ~ defer-high-value-refund          defer → deny
+  - permit-all-reads                 permit
+```
+
+Symbols:
+- `+` — rule added
+- `~` — rule modified
+- `-` — rule removed
+
+<Warning>
+Always review diffs carefully before deploying policy updates. Changed rules can affect running workflows.
+</Warning>
+
+## Testing in CI
+
+Integrate policy validation into your CI pipeline:
+
+### GitHub Actions
+
+```yaml .github/workflows/policy-validation.yml
+name: Policy Validation
+
+on:
+  pull_request:
+    paths:
+      - 'policies/**/*.yaml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Faramesh
+        run: |
+          curl -fsSL https://get.faramesh.dev | sh
+      
+      - name: Validate all policies
+        run: |
+          for policy in policies/*.yaml; do
+            faramesh policy validate "$policy"
+          done
+      
+      - name: Test payment policy
+        run: |
+          faramesh policy test policies/payment.yaml \
+            --tool stripe/refund \
+            --args '{"amount":600}' \
+            --json > result.json
+          
+          # Verify DEFER effect
+          jq -e '.effect == "DEFER"' result.json
+```
+
+### GitLab CI
+
+```yaml .gitlab-ci.yml
+policy-validation:
+  stage: test
+  image: faramesh/cli:latest
+  script:
+    - faramesh policy validate policies/*.yaml
+    - faramesh policy test policies/payment.yaml --tool stripe/refund --args '{"amount":600}'
+  only:
+    changes:
+      - policies/**/*.yaml
+```
+
+## Test Suite Pattern
+
+Create a test suite for critical policy rules:
+
+```bash test-policies.sh
+#!/bin/bash
+set -e
+
+POLICY="policies/production.yaml"
+
+echo "Testing payment policy..."
+
+# Test 1: High-value refund should DEFER
+result=$(faramesh policy test "$POLICY" \
+  --tool stripe/refund \
+  --args '{"amount":600}' \
+  --json)
+effect=$(echo "$result" | jq -r '.effect')
+[[ "$effect" == "DEFER" ]] || { echo "FAIL: Expected DEFER, got $effect"; exit 1; }
+echo "✓ High-value refund defers"
+
+# Test 2: Normal refund should PERMIT
+result=$(faramesh policy test "$POLICY" \
+  --tool stripe/refund \
+  --args '{"amount":100}' \
+  --json)
+effect=$(echo "$result" | jq -r '.effect')
+[[ "$effect" == "PERMIT" ]] || { echo "FAIL: Expected PERMIT, got $effect"; exit 1; }
+echo "✓ Normal refund permits"
+
+# Test 3: Destructive shell should DENY
+result=$(faramesh policy test "$POLICY" \
+  --tool shell/run \
+  --args '{"cmd":"rm -rf /"}' \
+  --json)
+effect=$(echo "$result" | jq -r '.effect')
+[[ "$effect" == "DENY" ]] || { echo "FAIL: Expected DENY, got $effect"; exit 1; }
+echo "✓ Destructive shell denies"
+
+# Test 4: Mass email should DENY
+result=$(faramesh policy test "$POLICY" \
+  --tool send_email \
+  --args '{"recipients":["user1@example.com","user2@example.com","user3@example.com","user4@example.com","user5@example.com","user6@example.com","user7@example.com","user8@example.com","user9@example.com","user10@example.com","user11@example.com"]}' \
+  --json | jq -r '.effect')
+[[ "$result" == "DENY" ]] || { echo "FAIL: Mass email should deny"; exit 1; }
+echo "✓ Mass email denies"
+
+echo ""
+echo "All tests passed!"
+```
+
+Run the test suite:
+
+```bash
+chmod +x test-policies.sh
+./test-policies.sh
+```
+
+## Debugging Policy Rules
+
+### Check Which Rule Matches
+
+If you're unsure which rule is firing:
+
+```bash
+faramesh policy test policy.yaml \
+  --tool stripe/refund \
+  --args '{"amount":600}'
+```
+
+The output shows the matched rule ID:
+
+```
+  Rule:    defer-high-value-refund
+```
+
+### Test Expression Evaluation
+
+If a `when:` expression isn't matching as expected, test with different argument values:
+
+```bash
+# Should match (amount > 500)
+faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":600}'
+
+# Should not match (amount <= 500)
+faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":500}'
+```
+
+### Inspect Compiled Policy
+
+View the compiled policy structure:
+
+```bash
+faramesh policy inspect policy.yaml
+```
+
+This shows:
+- All rules in order
+- Tool patterns
+- When conditions (truncated)
+
+## Hot Reloading Policies
+
+Reload a running daemon's policy without restart:
+
+```bash
+faramesh policy reload
+```
+
+This sends `SIGHUP` to the daemon, which:
+1. Re-reads the policy file from disk
+2. Validates and compiles the new policy
+3. Atomically swaps in the new policy
+4. Continues in-flight evaluations on old policy
+5. Uses new policy for new evaluations
+
+<Info>
+Policy reload is **zero-downtime**. In-flight tool calls complete on the old policy; new calls use the new policy immediately.
+</Info>
+
+### Custom Data Directory
+
+If the daemon uses a custom data directory:
+
+```bash
+faramesh policy reload --data-dir /var/lib/faramesh
+```
+
+## Policy Deployment Checklist
+
+<Steps>
+  <Step title="Write Policy">
+    Create policy YAML with rules, tools, and scanners.
+  </Step>
+  
+  <Step title="Validate">
+    ```bash
+    faramesh policy validate policy.yaml
+    ```
+  </Step>
+  
+  <Step title="Test Edge Cases">
+    ```bash
+    faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":600}'
+    faramesh policy test policy.yaml --tool shell/run --args '{"cmd":"rm -rf /"}'
+    ```
+  </Step>
+  
+  <Step title="Compare with Production">
+    ```bash
+    faramesh policy diff production.yaml new-policy.yaml
+    ```
+  </Step>
+  
+  <Step title="Deploy">
+    Copy policy file to production server.
+  </Step>
+  
+  <Step title="Reload Daemon">
+    ```bash
+    faramesh policy reload
+    ```
+  </Step>
+  
+  <Step title="Monitor">
+    Watch audit logs for DENY/DEFER events.
+  </Step>
+</Steps>
+
+## Best Practices
+
+<Card title="Test in CI" icon="check">
+  Run `faramesh policy validate` in CI to catch errors before they reach production.
+</Card>
+
+<Card title="Test Critical Rules" icon="shield">
+  Always test rules that DENY or DEFER high-stakes operations.
+</Card>
+
+<Card title="Review Diffs" icon="code-compare">
+  Use `faramesh policy diff` before deploying policy updates.
+</Card>
+
+<Card title="Version Policies" icon="code-branch">
+  Store policies in version control. Tag releases.
+</Card>
+
+<Card title="Monitor After Deployment" icon="chart-line">
+  Watch audit logs and metrics after deploying policy changes.
+</Card>
+
+## Common Testing Mistakes
+
+<Warning>
+**Missing quotes in JSON args**
+
+```bash
+# ❌ BAD: Missing quotes around keys
+--args '{amount:600}'
+
+# ✅ GOOD: Valid JSON
+--args '{"amount":600}'
+```
+</Warning>
+
+<Warning>
+**Testing wrong tool ID**
+
+```bash
+# ❌ BAD: Tool ID doesn't match policy
+--tool stripe_refund  # policy uses "stripe/refund"
+
+# ✅ GOOD: Exact match
+--tool stripe/refund
+```
+</Warning>
+
+<Warning>
+**Not testing default effect**
+
+Always test tool calls that don't match any rule to verify `default_effect`:
+
+```bash
+faramesh policy test policy.yaml --tool unknown/tool --args '{}'
+```
+</Warning>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Best Practices" icon="lightbulb" href="/policies/best-practices">
+    Policy patterns and anti-patterns
+  </Card>
+  <Card title="Writing Policies" icon="pen-to-square" href="/policies/writing-policies">
+    Policy authoring guide
+  </Card>
+  <Card title="Expressions" icon="function" href="/policies/expressions">
+    expr-lang expression reference
+  </Card>
+  <Card title="Scanners" icon="radar" href="/policies/scanners">
+    Output scanning reference
+  </Card>
+</CardGroup>

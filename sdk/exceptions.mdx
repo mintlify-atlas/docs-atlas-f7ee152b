@@ -1,0 +1,371 @@
+---
+title: "Exception Types"
+description: "Exception hierarchy for the Faramesh Python SDK"
+icon: "triangle-exclamation"
+---
+
+## Exception hierarchy
+
+All Faramesh exceptions inherit from `FarameshError`:
+
+```
+FarameshError (base)
+├── DenyError
+├── DeferredError
+└── DaemonError
+```
+
+You can catch all Faramesh-related exceptions with:
+
+```python
+from faramesh import FarameshError
+
+try:
+    governed_function()
+except FarameshError as e:
+    # Handle any Faramesh error
+    print(f"Governance error: {e}")
+```
+
+## FarameshError
+
+```python
+class FarameshError(Exception):
+    """Base class for all Faramesh errors."""
+```
+
+Base exception class for all Faramesh SDK errors. You typically won't catch this directly—use the specific subclasses instead.
+
+## DenyError
+
+```python
+class DenyError(FarameshError):
+    """Raised when the governance policy denies a tool call."""
+```
+
+Raised when a policy rule explicitly denies a tool invocation. The function is **not executed**.
+
+### Attributes
+
+<ParamField path="tool_id" type="str">
+  The identifier of the tool that was denied.
+
+  ```python
+  try:
+      delete_user(user_id="123")
+  except DenyError as e:
+      print(e.tool_id)  # "delete_user"
+  ```
+</ParamField>
+
+<ParamField path="rule_id" type="str | None">
+  The ID of the policy rule that denied the call. `None` if denied by default (no matching PERMIT rule).
+
+  ```python
+  except DenyError as e:
+      if e.rule_id:
+          print(f"Denied by rule: {e.rule_id}")
+      else:
+          print("Denied by default (no matching rule)")
+  ```
+</ParamField>
+
+<ParamField path="reason_code" type="str">
+  Machine-readable denial reason code. Useful for programmatic handling.
+
+  Common codes:
+  - `"DENY"` — Default denial
+  - `"AMOUNT_LIMIT_EXCEEDED"` — Custom code from policy
+  - `"RESTRICTED_DOMAIN"` — Custom code from policy
+
+  ```python
+  except DenyError as e:
+      if e.reason_code == "AMOUNT_LIMIT_EXCEEDED":
+          print("Transaction amount too high")
+  ```
+</ParamField>
+
+<ParamField path="reason" type="str">
+  Human-readable explanation of why the call was denied.
+
+  ```python
+  except DenyError as e:
+      print(e.reason)  # "amount exceeds $10,000 limit"
+  ```
+</ParamField>
+
+### Example
+
+```python
+from faramesh import govern, DenyError
+
+@govern(policy="policy.yaml")
+def transfer_funds(amount: float):
+    # Transfer implementation
+    pass
+
+try:
+    transfer_funds(amount=50000)
+except DenyError as e:
+    print(f"Transfer denied: {e.reason}")
+    print(f"Rule: {e.rule_id}")
+    print(f"Code: {e.reason_code}")
+    # Log to monitoring system
+    logger.warning(
+        "Denied transfer",
+        tool=e.tool_id,
+        rule=e.rule_id,
+        reason=e.reason
+    )
+```
+
+### Message format
+
+The exception message follows this format:
+
+```
+DENY  {tool_id}  rule={rule_id}  reason={reason}
+```
+
+Example:
+
+```
+DENY  transfer_funds  rule=limit_check  reason=amount exceeds $10,000 limit
+```
+
+## DeferredError
+
+```python
+class DeferredError(FarameshError):
+    """Raised when a deferred tool call times out or is denied."""
+```
+
+Raised when a tool call requires human approval (`DEFER` effect) but:
+- The approval window expired (timeout), OR
+- The approver explicitly denied the request
+
+The SDK **blocks** waiting for approval when a `DEFER` is returned. This exception is only raised if approval doesn't arrive in time or is denied.
+
+### Attributes
+
+<ParamField path="tool_id" type="str">
+  The identifier of the tool that was deferred.
+
+  ```python
+  except DeferredError as e:
+      print(e.tool_id)  # "send_email"
+  ```
+</ParamField>
+
+<ParamField path="defer_token" type="str">
+  Unique token for this deferred request. Used by approvers to approve or deny the call via the CLI or API.
+
+  ```python
+  except DeferredError as e:
+      print(f"Approval token: {e.defer_token}")
+      print(f"Approve with: faramesh agent approve {e.defer_token}")
+  ```
+</ParamField>
+
+<ParamField path="reason" type="str">
+  Human-readable explanation of why the call was deferred.
+
+  ```python
+  except DeferredError as e:
+      print(e.reason)  # "external email requires approval"
+  ```
+</ParamField>
+
+<ParamField path="expired" type="bool">
+  `True` if the deferred request timed out without approval. `False` if it was explicitly denied by an approver.
+
+  ```python
+  except DeferredError as e:
+      if e.expired:
+          print("Approval window expired")
+      else:
+          print("Request was denied by approver")
+  ```
+</ParamField>
+
+### Example
+
+```python
+from faramesh import govern, DeferredError
+
+@govern(policy="policy.yaml")
+def send_email(to: str, subject: str, body: str):
+    # Email implementation
+    pass
+
+try:
+    send_email(
+        to="ceo@external.com",
+        subject="Partnership proposal",
+        body="..."
+    )
+except DeferredError as e:
+    if e.expired:
+        print(f"Email approval timed out. Token: {e.defer_token}")
+        print(f"To approve: faramesh agent approve {e.defer_token}")
+    else:
+        print(f"Email was denied by approver. Reason: {e.reason}")
+```
+
+### Message format
+
+The exception message format depends on whether the request expired or was denied:
+
+**Expired:**
+```
+DEFER expired  {tool_id}  token={defer_token}  Approve: faramesh agent approve {defer_token}
+```
+
+**Denied:**
+```
+DEFER denied  {tool_id}  token={defer_token}
+```
+
+Example:
+
+```
+DEFER expired  send_email  token=def_8kj32hs9f  Approve: faramesh agent approve def_8kj32hs9f
+```
+
+## DaemonError
+
+```python
+class DaemonError(FarameshError):
+    """Raised when the Faramesh daemon cannot be started or contacted."""
+```
+
+Raised when the SDK cannot communicate with the Faramesh daemon. Common causes:
+- Daemon is not running
+- Socket path is incorrect
+- Socket file has wrong permissions
+- Daemon crashed or is unresponsive
+
+### Example
+
+```python
+from faramesh import govern, DaemonError
+
+@govern(auto_start=False, socket_path="/tmp/faramesh.sock")
+def my_tool():
+    pass
+
+try:
+    my_tool()
+except DaemonError as e:
+    print(f"Cannot connect to daemon: {e}")
+    print("Start the daemon with: faramesh serve --policy policy.yaml")
+```
+
+### Common error messages
+
+**Socket not found:**
+```
+Daemon socket not found at /tmp/faramesh.sock. 
+Is the daemon running? Run: faramesh serve --policy policy.yaml
+```
+
+**Connection refused:**
+```
+Connection refused at /tmp/faramesh.sock. 
+Is the daemon running? Run: faramesh serve --policy policy.yaml
+```
+
+**Socket error:**
+```
+Socket error communicating with daemon: [Errno 13] Permission denied
+```
+
+## Exception handling patterns
+
+### Handle all governance errors
+
+```python
+from faramesh import govern, FarameshError
+
+@govern
+def risky_operation():
+    pass
+
+try:
+    risky_operation()
+except FarameshError as e:
+    # Catches DenyError, DeferredError, DaemonError
+    print(f"Governance error: {e}")
+```
+
+### Handle specific errors
+
+```python
+from faramesh import govern, DenyError, DeferredError, DaemonError
+
+@govern
+def my_tool():
+    pass
+
+try:
+    my_tool()
+except DenyError as e:
+    # Policy denied the call
+    logger.warning("Tool denied", rule=e.rule_id, reason=e.reason)
+except DeferredError as e:
+    # Deferred and timed out or denied
+    if e.expired:
+        send_notification(f"Approval needed: {e.defer_token}")
+    else:
+        logger.info("Tool call denied by approver")
+except DaemonError as e:
+    # Cannot reach the daemon
+    logger.error("Daemon unreachable", error=str(e))
+    raise  # Re-raise to fail fast
+```
+
+### Graceful degradation
+
+```python
+from faramesh import govern, DaemonError
+
+@govern(auto_start=False)
+def optional_governance_tool():
+    # Implementation
+    pass
+
+try:
+    optional_governance_tool()
+except DaemonError:
+    # Daemon not available — fall back to ungoverned execution
+    logger.warning("Governance unavailable, executing without policy")
+    optional_governance_tool.__wrapped__()
+```
+
+### Retry on daemon errors
+
+```python
+import time
+from faramesh import govern, DaemonError
+
+@govern
+def my_tool():
+    pass
+
+for attempt in range(3):
+    try:
+        my_tool()
+        break
+    except DaemonError as e:
+        if attempt < 2:
+            print(f"Daemon error (attempt {attempt + 1}/3): {e}")
+            time.sleep(1)
+        else:
+            raise
+```
+
+## See also
+
+- [govern() decorator](/sdk/govern-decorator) — Main SDK API
+- [Configuration](/sdk/configuration) — Configure timeouts and socket paths
+- [Policy reference](/policies/writing-policies) — Write governance rules that trigger these exceptions

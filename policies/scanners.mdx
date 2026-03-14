@@ -1,0 +1,471 @@
+---
+title: Output Scanners
+description: Pre/post-condition scanners for secrets, PII, and prompt injection detection
+icon: radar
+---
+
+Faramesh scans tool outputs **after execution** to detect and redact secrets, PII, and prompt injection patterns before they reach the agent's context.
+
+This implements **Layer 2.2: Post-Execution Output Interception** from the Faramesh architecture.
+
+## How Output Scanning Works
+
+1. Tool call is `PERMIT`ted and executes
+2. Tool returns output (stdout, API response, etc.)
+3. Output passes through applicable `post_rules` scanners
+4. Matched patterns are redacted, hashed, or cause denial
+5. Clean output is returned to agent's context
+
+<Info>
+Scanning prevents secrets and PII from leaking into the agent's reasoning space, where they could be:
+- Included in subsequent prompts
+- Logged in conversation history
+- Sent to external APIs
+- Reflected in agent responses
+</Info>
+
+## Post-Rule Schema
+
+Post-rules are defined in the `post_rules:` block:
+
+```yaml
+post_rules:
+  - id: redact-stripe-secrets
+    match:
+      tool: stripe/*
+    scan:
+      - category: secret_aws_key
+        action: redact
+      - category: pii_email
+        action: redact
+      - pattern: '\b\d{16}\b'
+        action: redact
+        replacement: '[CARD]'
+        reason: credit card number
+```
+
+<ParamField path="id" type="string" required>
+  Unique identifier for this post-rule.
+</ParamField>
+
+<ParamField path="match.tool" type="string" required>
+  Glob pattern matching tool IDs to scan outputs from.
+  
+  Examples: `stripe/*`, `shell/run`, `*`
+</ParamField>
+
+<ParamField path="scan" type="array" required>
+  List of scan rules to apply to the output.
+</ParamField>
+
+## Scan Rule Actions
+
+<ParamField path="redact" type="action">
+  Replace matched text with `[REDACTED]` or custom replacement.
+  
+  Output is marked as `REDACTED` in audit logs.
+</ParamField>
+
+<ParamField path="deny" type="action">
+  Block the entire output if pattern matches.
+  
+  Tool call succeeds but output is not returned to agent. Logged as `DENIED`.
+</ParamField>
+
+<ParamField path="warn" type="action">
+  Log warning but pass output through unchanged.
+  
+  Useful for monitoring without disrupting workflows.
+</ParamField>
+
+<ParamField path="hash" type="action">
+  Replace matched text with deterministic hash.
+  
+  Useful for correlation without exposing actual values.
+</ParamField>
+
+## Built-In Scanner Categories
+
+Faramesh includes built-in scanners for common secret and PII patterns.
+
+### Secret Scanners
+
+<ParamField path="secret_aws_key" type="category">
+  AWS access keys (`AKIA...`)
+  
+  Pattern: `AKIA[0-9A-Z]{16}`
+</ParamField>
+
+<ParamField path="secret_github_pat" type="category">
+  GitHub personal access tokens (`ghp_...`)
+  
+  Pattern: `ghp_[a-zA-Z0-9]{36}`
+</ParamField>
+
+<ParamField path="secret_openai_key" type="category">
+  OpenAI API keys (`sk-...`)
+  
+  Pattern: `sk-[a-zA-Z0-9]{20,}`
+</ParamField>
+
+<ParamField path="secret_anthropic_key" type="category">
+  Anthropic API keys (`sk-ant-...`)
+  
+  Pattern: `sk-ant-[a-zA-Z0-9-]{20,}`
+</ParamField>
+
+<ParamField path="secret_gcp_sa" type="category">
+  GCP service account credentials
+  
+  Pattern: `"type"\s*:\s*"service_account"`
+</ParamField>
+
+<ParamField path="secret_azure_conn" type="category">
+  Azure connection strings
+  
+  Pattern: `(?i)(DefaultEndpointsProtocol=https?;AccountName=)`
+</ParamField>
+
+<ParamField path="secret_database_uri" type="category">
+  Database URIs with credentials
+  
+  Pattern: `(?i)(postgres|mysql|mongodb|redis)://[^\s]+:[^\s]+@`
+</ParamField>
+
+<ParamField path="secret_ssh_key" type="category">
+  SSH/TLS private keys
+  
+  Pattern: `-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----`
+</ParamField>
+
+<ParamField path="secret_bearer_token" type="category">
+  Bearer tokens
+  
+  Pattern: `(?i)bearer\s+[a-zA-Z0-9_\-\.]{20,}`
+</ParamField>
+
+<ParamField path="secrets_all" type="category">
+  Meta-category: All secret scanners above.
+  
+  Use this to enable all secret detection at once.
+</ParamField>
+
+### PII Scanners
+
+<ParamField path="pii_email" type="category">
+  Email addresses
+  
+  Pattern: `[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`
+</ParamField>
+
+<ParamField path="pii_phone" type="category">
+  US phone numbers
+  
+  Pattern: `(\+?1[-\.\s]?)?\(?\d{3}\)?[-\.\s]?\d{3}[-\.\s]?\d{4}`
+</ParamField>
+
+<ParamField path="pii_ssn" type="category">
+  Social Security Numbers
+  
+  Pattern: `\b\d{3}-\d{2}-\d{4}\b`
+</ParamField>
+
+<ParamField path="pii_credit_card" type="category">
+  Credit card numbers
+  
+  Pattern: `\b(?:\d[ -]*?){13,16}\b`
+</ParamField>
+
+<ParamField path="pii_ip_address" type="category">
+  IPv4 addresses
+  
+  Pattern: `\b(?:\d{1,3}\.){3}\d{1,3}\b`
+</ParamField>
+
+<ParamField path="pii_npi" type="category">
+  National Provider Identifiers
+  
+  Pattern: `\b\d{10}\b`
+</ParamField>
+
+<ParamField path="pii_iban" type="category">
+  International Bank Account Numbers
+  
+  Pattern: `\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]?){0,16}\b`
+</ParamField>
+
+### Injection Scanners
+
+<ParamField path="prompt_injection" type="category">
+  Prompt injection patterns
+  
+  Detects:
+  - `ignore all previous instructions`
+  - `system: you are now`
+  - Other prompt override attempts
+</ParamField>
+
+## Scanner Examples
+
+### Redact All Secrets from Stripe Outputs
+
+```yaml
+post_rules:
+  - id: redact-stripe-secrets
+    match:
+      tool: stripe/*
+    scan:
+      - category: secrets_all
+        action: redact
+      - category: pii_credit_card
+        action: redact
+```
+
+### Deny Shell Output with Private Keys
+
+```yaml
+post_rules:
+  - id: deny-shell-private-keys
+    match:
+      tool: shell/*
+    scan:
+      - category: secret_ssh_key
+        action: deny
+        reason: shell output contains private key
+```
+
+### Redact PII from Customer Service Tools
+
+```yaml
+post_rules:
+  - id: redact-customer-pii
+    match:
+      tool: customer_service/*
+    scan:
+      - category: pii_email
+        action: redact
+      - category: pii_phone
+        action: redact
+      - category: pii_ssn
+        action: redact
+      - category: pii_credit_card
+        action: redact
+        replacement: '[CARD REDACTED]'
+```
+
+### Warn on IP Address Leakage
+
+```yaml
+post_rules:
+  - id: warn-ip-leakage
+    match:
+      tool: "*"
+    scan:
+      - category: pii_ip_address
+        action: warn
+        reason: internal IP address detected in output
+```
+
+### Custom Pattern: Redact Internal Ticket IDs
+
+```yaml
+post_rules:
+  - id: redact-ticket-ids
+    match:
+      tool: jira/*
+    scan:
+      - pattern: 'TICKET-\d{4,}'
+        action: redact
+        replacement: '[TICKET]'
+        reason: internal ticket ID
+```
+
+### Hash Sensitive Identifiers for Correlation
+
+```yaml
+post_rules:
+  - id: hash-account-ids
+    match:
+      tool: analytics/*
+    scan:
+      - pattern: 'acct_[a-zA-Z0-9]{16}'
+        action: hash
+        reason: account ID for correlation only
+```
+
+### Deny Prompt Injection in Agent Outputs
+
+```yaml
+post_rules:
+  - id: deny-prompt-injection
+    match:
+      tool: "*"
+    scan:
+      - category: prompt_injection
+        action: deny
+        reason: potential prompt injection detected in tool output
+```
+
+## Output Size Limits
+
+Limit maximum output size with `max_output_bytes`:
+
+```yaml
+max_output_bytes: 1048576  # 1 MB limit
+
+post_rules:
+  - id: scan-all-outputs
+    match:
+      tool: "*"
+    scan:
+      - category: secrets_all
+        action: redact
+```
+
+Outputs exceeding the limit are denied with reason code `OUTPUT_SIZE_EXCEEDED`.
+
+## Scanner Performance
+
+- Scanners use compiled regex patterns (fast)
+- Scanning happens **after** tool execution (non-blocking)
+- Multiple patterns scan in parallel
+- Typical overhead: **&lt;1ms per output**
+
+<Warning>
+Very large outputs (>10 MB) or many complex regex patterns can add latency. Use `max_output_bytes` to enforce reasonable limits.
+</Warning>
+
+## Audit Trail
+
+All scan results are logged:
+
+```json
+{
+  "call_id": "call_abc123",
+  "tool_id": "shell/run",
+  "scan_outcome": "REDACTED",
+  "matches": [
+    {
+      "category": "secret_aws_key",
+      "action": "redact",
+      "reason_code": "OUTPUT_SECRET_AWS_KEY",
+      "offset": 142,
+      "length": 20
+    }
+  ]
+}
+```
+
+Use this to:
+- Detect accidental secret exposure
+- Audit PII handling
+- Monitor prompt injection attempts
+- Tune scanner sensitivity
+
+## Custom Scanner Patterns
+
+Define custom regex patterns for organization-specific secrets:
+
+```yaml
+vars:
+  internal_api_key_pattern: 'INT-[A-Z0-9]{32}'
+  customer_id_pattern: 'CUST-\d{8}'
+
+post_rules:
+  - id: redact-internal-secrets
+    match:
+      tool: "*"
+    scan:
+      - pattern: 'INT-[A-Z0-9]{32}'
+        action: redact
+        reason: internal API key
+      - pattern: 'CUST-\d{8}'
+        action: hash
+        reason: customer identifier
+```
+
+## Best Practices
+
+<Card title="Scan All External Tools" icon="globe">
+  Apply secret scanners to any tool calling external APIs:
+  
+  ```yaml
+  post_rules:
+    - match: { tool: "http/*" }
+      scan: [{ category: secrets_all, action: redact }]
+  ```
+</Card>
+
+<Card title="Deny Private Keys in Shell" icon="terminal">
+  Shell outputs should never contain private keys:
+  
+  ```yaml
+  post_rules:
+    - match: { tool: "shell/*" }
+      scan: [{ category: secret_ssh_key, action: deny }]
+  ```
+</Card>
+
+<Card title="Use Hash for Analytics" icon="chart-line">
+  Hash sensitive IDs when you need correlation but not actual values:
+  
+  ```yaml
+  scan: [{ pattern: 'user_[0-9]+', action: hash }]
+  ```
+</Card>
+
+<Card title="Monitor with Warn" icon="triangle-exclamation">
+  Use `warn` to detect patterns without breaking workflows:
+  
+  ```yaml
+  scan: [{ category: pii_email, action: warn }]
+  ```
+</Card>
+
+## Limitations
+
+<Warning>
+- Scanners only detect **known patterns**. They cannot detect all secrets.
+- Regex patterns can have false positives (e.g., `pii_credit_card` may match random 16-digit numbers).
+- Scanners run **after** execution. The tool has already executed; scanning only protects the agent's context.
+- Base64-encoded or obfuscated secrets may not be detected.
+</Warning>
+
+## Testing Scanners
+
+Test scanner behavior with sample outputs:
+
+```bash
+echo 'AWS_KEY=AKIAIOSFODNN7EXAMPLE' | faramesh policy scan policy.yaml shell/run
+```
+
+Expected output:
+
+```
+✓ Scanned output
+  Outcome:  REDACTED
+  Matches:  1
+    - category: secret_aws_key
+      action: redact
+      offset: 8
+
+Redacted output:
+AWS_KEY=[REDACTED]
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Testing Policies" icon="flask" href="/policies/testing">
+    Validate and test policies in CI
+  </Card>
+  <Card title="Best Practices" icon="lightbulb" href="/policies/best-practices">
+    Policy patterns and anti-patterns
+  </Card>
+  <Card title="Expressions" icon="function" href="/policies/expressions">
+    expr-lang expression reference
+  </Card>
+  <Card title="Policy Schema" icon="file-code" href="/policies/policy-schema">
+    Complete YAML schema
+  </Card>
+</CardGroup>

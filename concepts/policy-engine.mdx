@@ -1,0 +1,358 @@
+---
+title: Policy Engine
+description: YAML schema + expr-lang bytecode evaluation at ~1μs per rule
+---
+
+## Policy Language (FPL v1.0)
+
+Faramesh policies are written in **Faramesh Policy Language (FPL)**, a YAML-based DSL. Conditions are expr-lang expressions compiled to bytecode at load time.
+
+```yaml policies/payment.yaml
+faramesh-version: '1.0'
+agent-id: payment-bot
+default_effect: permit
+
+vars:
+  max_refund: 500
+  max_email_recipients: 50
+
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    tags: [financial]
+    cost_usd: 0.05  # Used for budget enforcement
+
+rules:
+  # Deny destructive shell commands — always.
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]"'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+
+  # Require human approval for high-value refunds.
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold — requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+
+  # Deny mass email.
+  - id: deny-mass-email
+    match:
+      tool: send_email
+      when: 'len(args["recipients"]) > 50'
+    effect: deny
+    reason: mass email to >50 recipients requires manual review
+    reason_code: MASS_EMAIL_LIMIT
+```
+
+## Schema Structure
+
+The policy document structure is defined in `internal/core/reference/policy-yaml.go`:
+
+```go internal/core/reference/policy-yaml.go
+type Doc struct {
+    FarameshVersion string            `yaml:"faramesh-version"`
+    AgentID         string            `yaml:"agent-id"`
+    Vars            map[string]any    `yaml:"vars"`
+    Tools           map[string]Tool   `yaml:"tools"`
+    Rules           []Rule            `yaml:"rules"`
+    Budget          *Budget           `yaml:"budget"`
+    DefaultEffect   string            `yaml:"default_effect"`
+    ContextGuards   []ContextGuard    `yaml:"context_guards"`
+    Webhooks        *WebhookConfig    `yaml:"webhooks"`
+}
+
+type Rule struct {
+    ID           string `yaml:"id"`
+    Match        Match  `yaml:"match"`
+    Effect       string `yaml:"effect"` // permit, deny, defer, shadow
+    Reason       string `yaml:"reason"`
+    ReasonCode   string `yaml:"reason_code"`
+}
+
+type Match struct {
+    Tool string `yaml:"tool"` // glob pattern: "stripe/*", "shell/run", "*"
+    When string `yaml:"when"` // expr-lang expression
+}
+```
+
+## Rule Evaluation: First-Match-Wins
+
+Rules are evaluated in **document order**. The first rule whose `tool` pattern and `when` condition both match determines the outcome.
+
+```go internal/core/policy/engine.go
+func (e *Engine) Evaluate(toolID string, ctx EvalContext) EvalResult {
+    for i, rule := range e.doc.Rules {
+        if !matchTool(rule.Match.Tool, toolID) {
+            continue
+        }
+        if e.programs[i] != nil {
+            out, err := vm.Run(e.programs[i], env)
+            if err != nil || out == nil {
+                continue
+            }
+            matched, ok := out.(bool)
+            if !ok || !matched {
+                continue
+            }
+        }
+        return EvalResult{
+            Effect:     rule.Effect,
+            RuleID:     rule.ID,
+            ReasonCode: rule.ReasonCode,
+            Reason:     rule.Reason,
+        }
+    }
+
+    // No rule matched → apply default_effect
+    return EvalResult{
+        Effect:     e.doc.DefaultEffect,
+        RuleID:     "",
+        ReasonCode: "UNMATCHED_DENY",
+        Reason:     "no rule matched; applying default_effect",
+    }
+}
+```
+
+<Info>
+**Performance**: Rules compile to expr-lang bytecode at load time. Evaluation is ~1μs per rule. A policy with 100 rules evaluates in ~100μs.
+</Info>
+
+## Expr-Lang Conditions
+
+The `when` field uses [expr-lang](https://github.com/expr-lang/expr), a Go-native expression language. It's type-safe, sandboxed, and compiles to bytecode.
+
+### Available Variables
+
+```go internal/core/policy/engine.go
+type EvalContext struct {
+    Args       map[string]any `expr:"args"`
+    Vars       map[string]any `expr:"vars"`
+    Session    SessionCtx     `expr:"session"`
+    Tool       ToolCtx        `expr:"tool"`
+    Principal  *PrincipalCtx  `expr:"principal"`
+    Delegation *DelegationCtx `expr:"delegation"`
+    Time       TimeCtx        `expr:"time"`
+}
+
+// SessionCtx exposes session-level data
+type SessionCtx struct {
+    CallCount    int64            `expr:"call_count"`
+    History      []map[string]any `expr:"history"`
+    CostUSD      float64          `expr:"cost_usd"`
+    DailyCostUSD float64          `expr:"daily_cost_usd"`
+}
+
+// ToolCtx exposes per-tool metadata
+type ToolCtx struct {
+    Reversibility string   `expr:"reversibility"`
+    BlastRadius   string   `expr:"blast_radius"`
+    Tags          []string `expr:"tags"`
+}
+```
+
+### Built-in Helper Functions
+
+Faramesh injects history analysis helpers into the expr environment:
+
+```yaml
+# Check if a tool was called recently
+when: 'history_contains_within("http/post", 120)'
+
+# Enforce call sequence
+when: 'history_sequence("read_file", "shell/exec", "http/post")'
+
+# Count tool calls in history
+when: 'history_tool_count("stripe/*") > 3'
+
+# Detect repeated denials (policy evasion)
+when: 'deny_count_within(60) > 5'
+
+# Array helpers
+when: 'args_array_len("recipients") > 10'
+when: 'args_array_contains("recipients", "ceo@company.com")'
+when: 'args_array_any_match("recipients", "*@external.com")'
+```
+
+## Condition Examples
+
+<CodeGroup>
+```yaml Simple Value Check
+- id: deny-large-refund
+  match:
+    tool: stripe/refund
+    when: 'args["amount"] > 1000'
+  effect: deny
+```
+
+```yaml Session Budget
+- id: deny-cost-exceeded
+  match:
+    tool: "*"
+    when: 'session.cost_usd > 10.0'
+  effect: deny
+  reason: session cost limit reached
+```
+
+```yaml Tool Metadata
+- id: defer-irreversible-tools
+  match:
+    tool: "*"
+    when: 'tool.reversibility == "irreversible" && tool.blast_radius == "external"'
+  effect: defer
+  reason: irreversible external action requires approval
+```
+
+```yaml Time-Based
+- id: deny-after-hours
+  match:
+    tool: "stripe/*"
+    when: 'time.hour < 9 || time.hour > 17'
+  effect: deny
+  reason: financial operations allowed 9am-5pm UTC only
+```
+
+```yaml Principal Context
+- id: require-verified-principal
+  match:
+    tool: "shell/*"
+    when: '!principal.verified'
+  effect: deny
+  reason: shell access requires verified principal
+```
+
+```yaml Delegation Depth
+- id: limit-delegation-depth
+  match:
+    tool: "*"
+    when: 'delegation.depth > 3'
+  effect: deny
+  reason: delegation chain too deep (max 3 levels)
+```
+</CodeGroup>
+
+## Tool Patterns
+
+The `tool` field supports glob-style patterns:
+
+```yaml
+tool: "stripe/*"          # Matches stripe/refund, stripe/charge, etc.
+tool: "shell/run"         # Exact match
+tool: "*"                 # Matches everything (catch-all)
+```
+
+Implementation in `internal/core/policy/engine.go`:
+
+```go
+func matchTool(pattern, toolID string) bool {
+    if pattern == "" || pattern == "*" {
+        return true
+    }
+    matched, err := path.Match(pattern, toolID)
+    if err != nil {
+        return strings.HasPrefix(toolID, strings.TrimSuffix(pattern, "*"))
+    }
+    return matched
+}
+```
+
+## Budget Enforcement
+
+Budgets are checked **before** policy evaluation (step 5 in the pipeline):
+
+```yaml
+budget:
+  max_calls: 500         # Total calls per session
+  session_usd: 5.00      # Max spend per session
+  daily_usd: 50.00       # Max spend per calendar day (persisted)
+  on_exceed: deny        # deny | defer
+```
+
+Implementation in `internal/core/pipeline.go`:
+
+```go pipeline.go:318
+func (p *Pipeline) checkBudget(agentID string, budget *policy.Budget, callCount int64) (bool, string, string) {
+    if budget.MaxCalls > 0 && callCount > budget.MaxCalls {
+        return true, reasons.SessionToolLimit,
+            fmt.Sprintf("session call limit reached (%d/%d)", callCount, budget.MaxCalls)
+    }
+    sess := p.sessions.Get(agentID)
+    if budget.SessionUSD > 0 {
+        cost := sess.CurrentCostUSD()
+        if cost >= budget.SessionUSD {
+            return true, reasons.BudgetSessionExceeded,
+                fmt.Sprintf("session cost limit reached ($%.4f/$%.4f)", cost, budget.SessionUSD)
+        }
+    }
+    if budget.DailyUSD > 0 {
+        cost := sess.DailyCostUSD()
+        if cost >= budget.DailyUSD {
+            return true, reasons.BudgetDailyExceeded,
+                fmt.Sprintf("daily cost limit reached ($%.4f/$%.4f)", cost, budget.DailyUSD)
+        }
+    }
+    return false, "", ""
+}
+```
+
+## Validate Policies in CI
+
+```bash
+# Validate YAML structure and compile all conditions
+faramesh policy validate policies/payment.yaml
+
+# Test a policy against a mock tool call
+faramesh policy test policies/payment.yaml --tool stripe/refund --args '{"amount": 600}'
+# Output: DEFER (rule: defer-high-value-refund)
+
+# Inspect compiled policy
+faramesh policy inspect policies/payment.yaml
+```
+
+Validation compiles all `when` expressions at load time:
+
+```go internal/core/policy/engine.go
+func NewEngine(doc *Doc, version string) (*Engine, error) {
+    programs := make([]*vm.Program, len(doc.Rules))
+    for i, rule := range doc.Rules {
+        if rule.Match.When == "" {
+            programs[i] = nil
+            continue
+        }
+        prog, err := compileExpr(rule.Match.When, evalEnv(doc, nil))
+        if err != nil {
+            return nil, err  // Compile-time error prevents policy load
+        }
+        programs[i] = prog
+    }
+    return &Engine{doc: doc, version: version, programs: programs}, nil
+}
+```
+
+<Check>
+**CI Integration**: Add `faramesh policy validate` to your CI pipeline. Invalid policies fail the build.
+</Check>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="DPR Chain" icon="link" href="/concepts/dpr-chain">
+    See how every decision is audited
+  </Card>
+  <Card title="DEFER Workflow" icon="hand" href="/concepts/defer-workflow">
+    Learn the human-in-the-loop approval flow
+  </Card>
+  <Card title="Multi-Agent" icon="users" href="/concepts/multi-agent">
+    Shared budgets and session governance
+  </Card>
+  <Card title="Policy Examples" icon="book" href="/policies/best-practices">
+    Real-world policy patterns
+  </Card>
+</CardGroup>

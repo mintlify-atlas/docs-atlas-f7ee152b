@@ -1,0 +1,446 @@
+---
+title: 'faramesh policy'
+description: 'Policy lifecycle commands: validate, test, inspect, and manage policies'
+---
+
+## Overview
+
+The `faramesh policy` command group provides tools for the complete policy lifecycle — from authoring to deployment to debugging.
+
+## Commands
+
+- **`validate`** — Validate policy syntax and compilation
+- **`inspect`** — Show compiled policy summary
+- **`test`** — Test a tool call against a policy
+- **`diff`** — Compare two policy versions
+- **`reload`** — Hot-reload policy in running daemon
+- **`replay`** — Replay historical decisions to predict drift
+- **`debug`** — Step-through rule evaluation trace
+- **`cover`** — Analyze policy coverage gaps
+
+---
+
+## faramesh policy validate
+
+Validate a policy file's syntax and compilation.
+
+### Usage
+```bash
+faramesh policy validate <policy.yaml>
+```
+
+### What It Does
+1. Parses YAML syntax
+2. Validates rule structure
+3. Compiles all `when` conditions with expr-lang
+4. Checks for semantic errors
+5. Reports warnings for potential issues
+
+### Examples
+
+#### Valid Policy
+```bash
+$ faramesh policy validate policy.yaml
+✓ policy.yaml  [1.0]  5 rules  agent=payment-bot
+```
+
+#### Policy with Warnings
+```bash
+$ faramesh policy validate policy.yaml
+⚠ warning: rule 'allow-all' has no match condition (matches all tools)
+✓ policy.yaml  [1.0]  3 rules  agent=my-agent  (1 warning(s))
+```
+
+#### Invalid Policy
+```bash
+$ faramesh policy validate policy.yaml
+✗ compilation error: rule 'high-value': when condition syntax error at line 1, column 15: unexpected token
+```
+
+### CI/CD Integration
+```bash
+# Exit code 0 on success, 1 on error
+faramesh policy validate policy.yaml || exit 1
+```
+
+---
+
+## faramesh policy inspect
+
+Show a compiled policy summary.
+
+### Usage
+```bash
+faramesh policy inspect <policy.yaml>
+```
+
+### Example Output
+```bash
+$ faramesh policy inspect policy.yaml
+Policy: policy.yaml
+  version    : 1.0
+  agent-id   : payment-bot
+  fpl        : 1.0
+  rules      : 5
+  tools      : 3 declared
+  default    : deny
+
+Rules:
+  DENY     deny-destructive-shell       tool=shell/run
+  DEFER    defer-high-value              tool=stripe/refund  when="args[\"amount\"] > 500"
+  PERMIT   allow-read-only               tool=*  when="tool.reversibility == \"reversible\""
+  DENY     deny-bulk-operations          tool=*  when="len(args[\"recipients\"]) > 100"
+  PERMIT   allow-safe-tools              tool=*
+```
+
+---
+
+## faramesh policy test
+
+Evaluate a tool call against a policy (dry-run).
+
+### Usage
+```bash
+faramesh policy test <policy.yaml> --tool <tool-id> --args '<json>'
+```
+
+### Flags
+
+<ParamField path="--tool" type="string" required>
+  Tool ID to test
+</ParamField>
+
+<ParamField path="--args" type="string" default="{}">
+  Tool arguments as JSON object
+</ParamField>
+
+<ParamField path="--json" type="boolean" default="false">
+  Output full decision as JSON
+</ParamField>
+
+### Examples
+
+#### Test Refund Below Threshold
+```bash
+$ faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":100}'
+
+  Tool:    stripe/refund
+  Effect:  PERMIT
+  Rule:    allow-low-value
+  Reason:  low-value refund permitted
+  Code:    
+```
+
+#### Test Refund Above Threshold
+```bash
+$ faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":5000}'
+
+  Tool:    stripe/refund
+  Effect:  DEFER
+  Rule:    defer-high-value
+  Reason:  high-value operation requires human approval
+  Code:    HIGH_VALUE_THRESHOLD
+```
+
+#### Test Destructive Shell Command
+```bash
+$ faramesh policy test policy.yaml --tool shell/run --args '{"cmd":"rm -rf /"}'
+
+  Tool:    shell/run
+  Effect:  DENY
+  Rule:    deny-destructive-shell
+  Reason:  destructive shell command blocked by policy
+  Code:    DESTRUCTIVE_SHELL_COMMAND
+```
+
+#### JSON Output
+```bash
+$ faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":5000}' --json
+{
+  "effect": "DEFER",
+  "rule_id": "defer-high-value",
+  "reason": "high-value operation requires human approval",
+  "reason_code": "HIGH_VALUE_THRESHOLD",
+  "latency": "1.2ms"
+}
+```
+
+---
+
+## faramesh policy diff
+
+Compare two policy versions.
+
+### Usage
+```bash
+faramesh policy diff <old.yaml> <new.yaml>
+```
+
+### Example Output
+```bash
+$ faramesh policy diff policies/v1.yaml policies/v2.yaml
+
+Policy diff
+  old: policies/v1.yaml  [1.0]  3 rules
+  new: policies/v2.yaml  [1.1]  5 rules
+
+  + allow-read-customer               PERMIT
+  + allow-low-value-refund            PERMIT
+  ~ defer-high-value                  DEFER → DENY
+  - allow-all-tools                   PERMIT
+```
+
+Color-coded:
+- **Green (+)** — Rule added
+- **Yellow (~)** — Rule modified
+- **Red (-)** — Rule removed
+
+---
+
+## faramesh policy reload
+
+Hot-reload policy in a running daemon.
+
+### Usage
+```bash
+faramesh policy reload
+```
+
+### Flags
+
+<ParamField path="--data-dir" type="string">
+  Data directory (default: `$TMPDIR/faramesh`)
+</ParamField>
+
+### What It Does
+1. Finds running daemon via PID file
+2. Sends SIGHUP signal
+3. Daemon re-reads policy from disk
+4. Atomically swaps to new policy
+5. In-flight evaluations complete on old policy
+6. New evaluations use new policy
+
+### Example
+```bash
+# Terminal 1: Daemon is running
+$ faramesh serve --policy policy.yaml
+
+# Terminal 2: Edit policy
+$ vim policy.yaml
+
+# Terminal 2: Reload without restarting
+$ faramesh policy reload
+✓ Sent SIGHUP to daemon (pid 12345) — policy reloading from /tmp/faramesh.sock
+
+# Terminal 1: Daemon logs
+{"level":"info","msg":"received SIGHUP, reloading policy"}
+{"level":"info","msg":"policy reloaded","version":"1.1","rules":6}
+```
+
+---
+
+## faramesh policy replay
+
+Replay historical decisions against a new policy to predict drift.
+
+### Usage
+```bash
+faramesh policy replay <policy.yaml> <dpr.db>
+```
+
+### Flags
+
+<ParamField path="--limit" type="number" default="500">
+  Max DPR records to replay
+</ParamField>
+
+<ParamField path="--json" type="boolean" default="false">
+  Output drift report as JSON
+</ParamField>
+
+### What It Does
+1. Loads historical decisions from DPR database
+2. Re-evaluates each against the new policy
+3. Identifies decisions that would change
+4. Shows drift percentage and details
+
+### Example Output
+```bash
+$ faramesh policy replay policies/v2.yaml data/dpr.db
+
+Policy Replay — drift prediction
+  policy : policies/v2.yaml [1.1]
+  source : data/dpr.db  (247 records)
+
+  ⚠ 12 of 247 decisions (4.9%) would change:
+
+    stripe/refund          PERMIT   → DEFER    agent=payment-bot
+    stripe/refund          PERMIT   → DEFER    agent=payment-bot
+    shell/run              DEFER    → DENY     agent=dev-agent
+    send_email             PERMIT   → DENY     agent=marketing-agent
+    ...
+```
+
+This is the governance equivalent of **`terraform plan`** — see the impact before deploying.
+
+---
+
+## faramesh policy debug
+
+Step-through rule evaluation trace.
+
+### Usage
+```bash
+faramesh policy debug <policy.yaml> --tool <tool-id> --args '<json>'
+```
+
+### Flags
+
+<ParamField path="--tool" type="string" required>
+  Tool ID to debug
+</ParamField>
+
+<ParamField path="--args" type="string" default="{}">
+  Tool arguments as JSON
+</ParamField>
+
+<ParamField path="--unsafe-raw-args" type="boolean" default="false">
+  Print raw argument JSON without redaction (use with caution)
+</ParamField>
+
+### Example Output
+```bash
+$ faramesh policy debug policy.yaml --tool stripe/refund --args '{"amount":5000}'
+
+Policy Debug — rule-by-rule trace
+  policy : policy.yaml [1.0]
+  tool   : stripe/refund
+  args   : {"amount":"[REDACTED]"}
+  note   : argument display is redacted by default; use --unsafe-raw-args to print raw values
+
+  Rule evaluation trace:
+
+  [0] deny-destructive-shell    SKIP  tool="shell/run" does not match "stripe/refund"
+  [1] allow-read-only           SKIP  when="tool.reversibility == 'reversible'" → false
+  [2] defer-high-value          ▶ DEFER  when="args[\"amount\"] > 500" → true
+  [3] allow-low-value           SKIP  (earlier rule matched first)
+  [4] allow-all                 SKIP  (earlier rule matched first)
+
+  Result: DEFER  (rule: defer-high-value)
+```
+
+Invaluable for debugging complex policies.
+
+---
+
+## faramesh policy cover
+
+Analyze policy coverage — find tools without matching rules.
+
+### Usage
+```bash
+faramesh policy cover <policy.yaml>
+```
+
+### Flags
+
+<ParamField path="--tools" type="string">
+  Comma-separated tool IDs to check (in addition to declared tools)
+</ParamField>
+
+### What It Does
+1. Probes synthetic tool IDs + declared tools
+2. Checks which tools match at least one rule
+3. Reports uncovered tools (fall through to `default_effect`)
+4. Shows dead rules (never match any probed tool)
+
+### Example Output
+```bash
+$ faramesh policy cover policy.yaml
+
+Policy Coverage Analysis
+  policy   : policy.yaml
+  rules    : 5
+  probes   : 24 tool IDs
+  default  : deny
+
+  ✓ 18 tools covered by explicit rules
+  ✗ 6 tools fall through to default_effect (deny):
+      http/delete
+      db/delete
+      aws/s3/put
+      aws/lambda/invoke
+      file/delete
+      slack/post
+
+  ℹ 1 rules matched no probed tools (may match unlisted tools):
+      allow-internal-tools
+```
+
+### CI/CD Integration
+Fail build if tools are uncovered:
+```bash
+faramesh policy cover policy.yaml || exit 1
+```
+
+---
+
+## Common Workflows
+
+### 1. Policy Authoring
+```bash
+# Write policy
+vim policy.yaml
+
+# Validate syntax
+faramesh policy validate policy.yaml
+
+# Test specific scenarios
+faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":500}'
+faramesh policy test policy.yaml --tool shell/run --args '{"cmd":"ls"}'
+
+# Check coverage
+faramesh policy cover policy.yaml
+```
+
+### 2. Pre-Deployment Validation
+```bash
+# Compare with current production policy
+faramesh policy diff production.yaml staging.yaml
+
+# Predict impact on historical decisions
+faramesh policy replay staging.yaml production-dpr.db
+
+# If safe, deploy
+cp staging.yaml production.yaml
+faramesh policy reload
+```
+
+### 3. Debugging
+```bash
+# Step through rule evaluation
+faramesh policy debug policy.yaml --tool problematic/tool --args '{...}'
+
+# Inspect compiled policy
+faramesh policy inspect policy.yaml
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Write Policies" icon="file-code" href="/policies/writing-policies">
+    Learn the Faramesh Policy Language (FPL)
+  </Card>
+  
+  <Card title="Start the Daemon" icon="server" href="/cli/serve">
+    Run `faramesh serve` with your policy
+  </Card>
+  
+  <Card title="Stream Decisions" icon="activity" href="/cli/audit">
+    Watch live decisions with `faramesh audit tail`
+  </Card>
+  
+  <Card title="Deploy to Production" icon="rocket" href="/deployment/daemon">
+    Production deployment patterns
+  </Card>
+</CardGroup>

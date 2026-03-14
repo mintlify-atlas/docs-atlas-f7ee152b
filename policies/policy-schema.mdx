@@ -1,0 +1,555 @@
+---
+title: Policy Schema Reference
+description: Complete YAML schema for Faramesh Policy Language (FPL) v1.0
+icon: file-code
+---
+
+This page documents the complete YAML schema for Faramesh policies, extracted from `internal/core/reference/policy-yaml.go`.
+
+## Top-Level Document
+
+```yaml
+faramesh-version: '1.0'
+agent-id: my-agent
+default_effect: deny
+vars: {}
+tools: {}
+rules: []
+post_rules: []
+budget: {}
+session: {}
+context_guards: []
+webhooks: {}
+max_output_bytes: 1048576
+compensation: {}
+```
+
+### Core Fields
+
+<ParamField path="faramesh-version" type="string" required>
+  Policy language version. Current version is `"1.0"`.
+</ParamField>
+
+<ParamField path="agent-id" type="string" required>
+  Unique identifier for this agent/policy. Used in audit logs and telemetry.
+</ParamField>
+
+<ParamField path="default_effect" type="string" default="deny">
+  Effect applied when no rule matches. Valid values: `permit`, `deny`, `defer`.
+</ParamField>
+
+<ParamField path="vars" type="object">
+  Policy-level variables accessible in expressions as `vars["key"]`.
+  
+  ```yaml
+  vars:
+    max_refund: 500
+    allowed_domains: [internal.example.com, api.company.com]
+  ```
+</ParamField>
+
+<ParamField path="tools" type="object">
+  Tool metadata declarations. Keys are tool IDs.
+  
+  See [Tools](#tools) below.
+</ParamField>
+
+<ParamField path="rules" type="array" required>
+  Ordered list of governance rules. First matching rule wins.
+  
+  See [Rules](#rules) below.
+</ParamField>
+
+<ParamField path="post_rules" type="array">
+  Post-execution output scanning rules.
+  
+  See [Post-Condition Rules](#post-condition-rules) below.
+</ParamField>
+
+<ParamField path="budget" type="object">
+  Cost and call limits.
+  
+  See [Budget](#budget) below.
+</ParamField>
+
+<ParamField path="session" type="object">
+  Session configuration.
+  
+  See [Session Config](#session-config) below.
+</ParamField>
+
+<ParamField path="context_guards" type="array">
+  Context freshness and completeness checks.
+  
+  See [Context Guards](#context-guards) below.
+</ParamField>
+
+<ParamField path="webhooks" type="object">
+  Webhook delivery configuration.
+  
+  See [Webhooks](#webhooks) below.
+</ParamField>
+
+<ParamField path="max_output_bytes" type="integer" default="0">
+  Maximum output size in bytes. Set to `0` for no limit. Outputs exceeding this size are denied with `OUTPUT_SIZE_EXCEEDED`.
+</ParamField>
+
+<ParamField path="compensation" type="object">
+  Compensating transaction metadata for reversible operations.
+  
+  See [Compensation](#compensation) below.
+</ParamField>
+
+## Tools
+
+The `tools:` block declares metadata about governed tools:
+
+```yaml
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    shadow_safe: false
+    tags: [financial, customer_impact]
+    cost_usd: 0.50
+    endpoint_pattern: "https://api.stripe.com/*"
+```
+
+<ParamField path="reversibility" type="string">
+  How easily the tool's actions can be undone:
+  - `read_only` — no state change
+  - `reversible` — can be undone automatically
+  - `compensatable` — requires compensating transaction
+  - `irreversible` — cannot be undone
+</ParamField>
+
+<ParamField path="blast_radius" type="string">
+  Scope of potential impact:
+  - `none` — no observable side effects (read-only)
+  - `local` — affects only this agent's session state
+  - `scoped` — affects bounded resources (e.g., single user)
+  - `system` — affects shared system resources
+  - `external` — affects external systems or multiple users
+</ParamField>
+
+<ParamField path="shadow_safe" type="boolean" default="false">
+  Whether this tool can be safely executed in shadow mode (dry-run with no side effects).
+</ParamField>
+
+<ParamField path="tags" type="array">
+  Arbitrary string tags for grouping and filtering. Reference in expressions:
+  
+  ```yaml
+  when: 'contains(tool.tags, "financial")'
+  ```
+</ParamField>
+
+<ParamField path="cost_usd" type="number" default="0.0">
+  Estimated cost in USD per successful call. Used for budget enforcement.
+</ParamField>
+
+<ParamField path="endpoint_pattern" type="string">
+  Glob pattern for HTTP endpoint URLs this tool calls. Used for domain allow/denylists.
+</ParamField>
+
+## Rules
+
+Rules are evaluated in document order. First match wins.
+
+```yaml
+rules:
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold and requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+    incident_category: financial_threshold
+    incident_severity: high
+```
+
+<ParamField path="id" type="string" required>
+  Unique rule identifier. Appears in audit logs. Must be unique within the policy.
+</ParamField>
+
+<ParamField path="match" type="object" required>
+  Conditions that trigger this rule.
+  
+  <ParamField path="match.tool" type="string">
+    Glob pattern matching tool IDs:
+    - `stripe/refund` — exact match
+    - `stripe/*` — all Stripe tools
+    - `*` — all tools (catch-all)
+  </ParamField>
+  
+  <ParamField path="match.when" type="string">
+    expr-lang boolean expression. Evaluated only if `tool` pattern matches.
+    
+    Available variables: `args`, `vars`, `session`, `tool`, `principal`, `delegation`, `time`
+    
+    See [Expressions](/policies/expressions).
+  </ParamField>
+</ParamField>
+
+<ParamField path="effect" type="string" required>
+  Action to take when rule matches:
+  - `permit` — allow execution
+  - `deny` — block execution
+  - `defer` — pause and require human approval
+  - `shadow` — simulate execution (no side effects)
+</ParamField>
+
+<ParamField path="reason" type="string">
+  Human-readable explanation. Shown to reviewers during `defer`, or to agent on `deny`.
+</ParamField>
+
+<ParamField path="reason_code" type="string">
+  Machine-readable code for analytics and automation. Examples: `HIGH_VALUE_REFUND`, `DESTRUCTIVE_SHELL_COMMAND`
+</ParamField>
+
+<ParamField path="incident_category" type="string">
+  Category for incident tracking: `financial_threshold`, `destructive_command`, `data_exfiltration`, etc.
+</ParamField>
+
+<ParamField path="incident_severity" type="string">
+  Severity level: `critical`, `high`, `medium`, `low`
+</ParamField>
+
+## Post-Condition Rules
+
+Post-rules scan tool outputs after execution. Use for secret/PII detection and redaction.
+
+```yaml
+post_rules:
+  - id: redact-stripe-secrets
+    match:
+      tool: stripe/*
+    scan:
+      - category: secret_openai_key
+        action: redact
+      - category: pii_email
+        action: redact
+      - pattern: '\b\d{16}\b'
+        action: redact
+        reason: credit card number
+```
+
+<ParamField path="id" type="string" required>
+  Unique post-rule identifier.
+</ParamField>
+
+<ParamField path="match" type="object" required>
+  <ParamField path="match.tool" type="string">
+    Tool ID pattern to scan outputs from.
+  </ParamField>
+</ParamField>
+
+<ParamField path="scan" type="array" required>
+  List of scan rules to apply to output.
+  
+  <ParamField path="scan[].category" type="string">
+    Built-in scanner category. See [Scanners](/policies/scanners).
+    
+    Examples: `secret_aws_key`, `pii_email`, `prompt_injection`
+  </ParamField>
+  
+  <ParamField path="scan[].pattern" type="string">
+    Custom regex pattern. Mutually exclusive with `category`.
+  </ParamField>
+  
+  <ParamField path="scan[].action" type="string" required>
+    Action on match:
+    - `redact` — replace with `[REDACTED]`
+    - `deny` — block entire output
+    - `warn` — log warning but pass through
+    - `hash` — replace with deterministic hash
+  </ParamField>
+  
+  <ParamField path="scan[].replacement" type="string">
+    Custom replacement text for `redact` action. Default: `[REDACTED]`
+  </ParamField>
+  
+  <ParamField path="scan[].reason" type="string">
+    Human-readable reason for `deny` action.
+  </ParamField>
+</ParamField>
+
+## Budget
+
+Enforce cost and call limits:
+
+```yaml
+budget:
+  daily_usd: 10.00
+  session_usd: 5.00
+  max_calls: 500
+  on_exceed: deny
+```
+
+<ParamField path="daily_usd" type="number">
+  Maximum USD spend per calendar day (persisted across restarts).
+</ParamField>
+
+<ParamField path="session_usd" type="number">
+  Maximum USD spend per session.
+</ParamField>
+
+<ParamField path="max_calls" type="integer">
+  Maximum total tool calls per session (all tools combined).
+</ParamField>
+
+<ParamField path="on_exceed" type="string" default="deny">
+  Effect when limit exceeded: `deny` or `defer`.
+</ParamField>
+
+## Session Config
+
+```yaml
+session:
+  identity: "user@example.com"
+  expiry: 3600s
+  history_calls: 100
+  history_secs: 600
+```
+
+<ParamField path="identity" type="string">
+  Principal identity for this session.
+</ParamField>
+
+<ParamField path="expiry" type="duration">
+  Session timeout. Format: `3600s`, `1h`, `30m`
+</ParamField>
+
+<ParamField path="history_calls" type="integer" default="100">
+  Number of recent calls to retain in session history.
+</ParamField>
+
+<ParamField path="history_secs" type="integer" default="600">
+  Time window (in seconds) for session history retention.
+</ParamField>
+
+## Context Guards
+
+Verify external context freshness before high-stakes actions:
+
+```yaml
+context_guards:
+  - source: stripe_account_status
+    endpoint: https://api.stripe.com/v1/accounts/{{account_id}}
+    required_fields: [status, balance]
+    max_age_seconds: 300
+    on_stale: defer
+    on_missing: deny
+```
+
+<ParamField path="source" type="string" required>
+  Human-readable context source name.
+</ParamField>
+
+<ParamField path="endpoint" type="string" required>
+  HTTP endpoint to check for freshness. Supports `{{var}}` interpolation.
+</ParamField>
+
+<ParamField path="required_fields" type="array">
+  Fields that must be present in the response.
+</ParamField>
+
+<ParamField path="max_age_seconds" type="integer" required>
+  Maximum age (in seconds) before context is considered stale.
+</ParamField>
+
+<ParamField path="on_stale" type="string" default="defer">
+  Effect when context is stale: `deny` or `defer`.
+</ParamField>
+
+<ParamField path="on_missing" type="string" default="deny">
+  Effect when required fields are missing: `deny` or `defer`.
+</ParamField>
+
+<ParamField path="on_inconsistent" type="string" default="defer">
+  Effect when context values are contradictory: `deny` or `defer`.
+</ParamField>
+
+## Webhooks
+
+Deliver policy events to external systems:
+
+```yaml
+webhooks:
+  url: https://hooks.example.com/faramesh
+  events: [deny, defer, defer_resolved]
+  secret: webhook_secret_key
+  timeout_ms: 5000
+```
+
+<ParamField path="url" type="string" required>
+  Destination URL for webhook POSTs.
+</ParamField>
+
+<ParamField path="events" type="array" required>
+  Event types to deliver:
+  - `deny` — rule blocked a tool call
+  - `defer` — rule deferred a tool call for approval
+  - `defer_resolved` — deferred call was approved/rejected
+  - `permit` — rule allowed a tool call
+  - `policy_activated` — policy was loaded/reloaded
+  - `kill_switch` — emergency kill switch triggered
+</ParamField>
+
+<ParamField path="secret" type="string">
+  HMAC-SHA256 signing secret for webhook payload verification.
+</ParamField>
+
+<ParamField path="timeout_ms" type="integer" default="5000">
+  HTTP timeout for webhook delivery in milliseconds.
+</ParamField>
+
+## Compensation
+
+Define how to reverse tool actions:
+
+```yaml
+compensation:
+  stripe/refund:
+    compensation_tool: stripe/reverse_refund
+    arg_mapping:
+      refund_id: $.result.id
+      reason: "automatic reversal"
+```
+
+<ParamField path="compensation_tool" type="string" required>
+  Tool ID to call for reversal.
+</ParamField>
+
+<ParamField path="arg_mapping" type="object" required>
+  Maps compensation tool arguments from original action result.
+  
+  Keys are argument names for the compensation tool.
+  
+  Values are JSONPath expressions into the original result, or literal values.
+</ParamField>
+
+## Advanced Features (v1.0 Extensions)
+
+### Phase Transitions
+
+Define workflow phase transitions:
+
+```yaml
+phases:
+  research:
+    tools: [http/get, search, browse]
+    duration: 300s
+    next: action
+  action:
+    tools: [stripe/refund, send_email]
+    duration: 600s
+
+phase_transitions:
+  - from: research
+    to: action
+    conditions: 'session.call_count > 5'
+    effect: permit_transition
+    reason: sufficient research completed
+
+phase_enforcement:
+  on_out_of_phase_call: defer
+  reason_code: OUT_OF_PHASE
+```
+
+### Session State Policy
+
+Govern multi-agent shared state:
+
+```yaml
+session_state_policy:
+  agent_id: orchestrator
+  declared_keys:
+    - key: customer_id
+      type: string
+      max_length: 64
+      scan: [injection]
+    - key: refund_amount
+      type: number
+      max_length: 10
+  undeclared_key_policy: deny
+  write_scan:
+    injection_detection: true
+    pii_scan: true
+    secret_scan: true
+```
+
+### Cross-Session Guards
+
+Detect accumulation attacks:
+
+```yaml
+cross_session_guards:
+  - scope: principal
+    tool_pattern: stripe/refund
+    metric: unique_record_count
+    window: 24h
+    max_unique_records: 100
+    on_exceed: defer
+    reason: unusual refund volume across sessions
+```
+
+### Loop Governance
+
+Govern critique/loop patterns:
+
+```yaml
+loop_governance:
+  agent_id: code_reviewer
+  max_iterations: 10
+  max_total_cost_usd: 5.0
+  max_duration_seconds: 300
+  on_max_reached: defer
+  convergence_tracking:
+    scan_results_across_iterations: true
+    repeated_scan_threshold: 3
+    on_evasion: deny
+```
+
+### Orchestrator Manifest
+
+Declare permitted sub-agent invocations:
+
+```yaml
+orchestrator_manifest:
+  agent_id: main_orchestrator
+  permitted_invocations:
+    - agent_id: research_agent
+      max_invocations_per_session: 5
+      requires_prior_approval: false
+    - agent_id: payment_agent
+      max_invocations_per_session: 1
+      requires_prior_approval: true
+  undeclared_invocation_policy: deny
+```
+
+## Schema Source
+
+This schema is generated from `internal/core/reference/policy-yaml.go` in the Faramesh source code. For the canonical Go type definitions, see:
+
+- `policy.Doc` — top-level document structure
+- `policy.Rule` — rule definition
+- `postcondition.PostRule` — post-condition scanning
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Expressions" icon="function" href="/policies/expressions">
+    expr-lang syntax and built-in helpers
+  </Card>
+  <Card title="Scanners" icon="radar" href="/policies/scanners">
+    Built-in secret and PII scanners
+  </Card>
+  <Card title="Testing" icon="flask" href="/policies/testing">
+    Validate and test policies
+  </Card>
+  <Card title="Best Practices" icon="lightbulb" href="/policies/best-practices">
+    Policy patterns and anti-patterns
+  </Card>
+</CardGroup>
